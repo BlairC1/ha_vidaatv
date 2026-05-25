@@ -1,4 +1,4 @@
-# Hisense TV Integration
+# Vidaa TV Integration
 
 Control your Hisense/Vidaa Smart TV from Home Assistant!
 
@@ -15,7 +15,7 @@ Control your Hisense/Vidaa Smart TV from Home Assistant!
 1. Install via HACS
 2. Restart Home Assistant
 3. Go to Settings → Devices & Services
-4. Your TV should appear as discovered, or click "Add Integration" and search for "Hisense TV"
+4. Your TV should appear as discovered, or click "Add Integration" and search for "Vidaa TV"
 5. Enter the PIN shown on your TV
 6. Done!
 
