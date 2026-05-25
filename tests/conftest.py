@@ -59,6 +59,7 @@ MOCK_DEVICE_INFO = {
     "model_name": "H55A6500",
     "network_type": "001122334455",
     "tv_version": "V0000.01.00a.N0816",
+    "ip": "192.168.1.100",
     "eth0": "001122334455",
     "wlan0": "665544332211",
 }

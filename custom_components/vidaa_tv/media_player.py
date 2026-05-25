@@ -82,20 +82,26 @@ class VidaaTVMediaPlayer(CoordinatorEntity[VidaaTVDataUpdateCoordinator], MediaP
 
     @property
     def device_info(self) -> DeviceInfo:
-        """Return device info."""
-        device_id = self._entry.data.get(CONF_DEVICE_ID)
-        mac = self._format_mac(device_id) if device_id else None
+        """Return device info, preferring the TV's live values."""
+        data = self.coordinator.device_data
+        # Stable identity: keep the existing identifier (device_id or entry_id);
+        # do not switch to a MAC for existing installs (would orphan the device).
+        device_id = self._entry.data.get(CONF_DEVICE_ID) or self._entry.entry_id
+        mac_src = data.get("device_id") or self._entry.data.get(CONF_DEVICE_ID)
+        mac = self._format_mac(mac_src) if mac_src else None
 
         info = DeviceInfo(
-            identifiers={(DOMAIN, device_id or self._entry.entry_id)},
-            name=self._entry.data.get(CONF_NAME, DEFAULT_NAME),
+            identifiers={(DOMAIN, device_id)},
+            name=data.get("name") or self._entry.data.get(CONF_NAME, DEFAULT_NAME),
             manufacturer="Hisense",
-            model=self._entry.data.get(CONF_MODEL),
-            sw_version=self._entry.data.get(CONF_SW_VERSION),
+            model=data.get("model") or self._entry.data.get(CONF_MODEL),
+            sw_version=data.get("sw_version") or self._entry.data.get(CONF_SW_VERSION),
         )
 
         if mac:
             info["connections"] = {(CONNECTION_NETWORK_MAC, mac)}
+        if data.get("ip"):
+            info["configuration_url"] = f"http://{data['ip']}"
 
         return info
 

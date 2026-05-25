@@ -58,101 +58,68 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._available = True
         self._device_info_fetched = False
         self._auth_failures = 0
+        # Parsed device info (model, sw_version, name, ip, device_id) cached from
+        # the TV's getdeviceinfo; entities build their DeviceInfo from this.
+        self.device_data: dict[str, Any] = {}
 
     @property
     def available(self) -> bool:
         """Return if TV is available."""
         return self._available
 
-    async def _async_update_device_info(self) -> None:
-        """Fetch and update device info in the device registry."""
+    async def _async_fetch_device_info(self) -> None:
+        """Fetch the TV's device info once and cache it in ``self.device_data``.
+
+        The entities build their ``DeviceInfo`` from this cache. The first
+        coordinator refresh runs before the entities/device are created, so the
+        cache is ready by the time HA reads ``device_info`` at device creation —
+        no after-the-fact device-registry surgery is required (that race is why
+        model/firmware previously never showed up).
+        """
         if self._device_info_fetched:
             return
 
         try:
-            device_info = await self.tv.async_get_device_info(timeout=5)
-            _LOGGER.debug("Got device info: %s", device_info)
-
-            if not device_info:
-                _LOGGER.warning("No device info returned from TV")
-                return
-
-            device_id = self.entry.data.get(CONF_DEVICE_ID)
-            _LOGGER.debug("Config entry device_id: %s", device_id)
-
-            if not device_id:
-                # Use MAC address based on network_type
-                network_type = device_info.get("network_type", "")
-                if network_type == "wlan":
-                    device_id = device_info.get("wlan0")
-                else:
-                    device_id = device_info.get("eth0")
-                # Fallback if primary not found
-                if not device_id:
-                    device_id = device_info.get("eth0") or device_info.get("wlan0")
-                _LOGGER.debug("Using %s MAC as device_id: %s", network_type or "fallback", device_id)
-
-            # Update device registry - try device_id first, then entry_id as fallback
-            device_registry = dr.async_get(self.hass)
-            device_entry = None
-
-            # Try with device_id from device info
-            if device_id:
-                device_entry = device_registry.async_get_device(
-                    identifiers={(DOMAIN, device_id)}
-                )
-                _LOGGER.debug("Lookup by device_id %s: found=%s", device_id, device_entry is not None)
-
-            # Fallback to entry_id (used when device_id was None during setup)
-            if not device_entry:
-                device_entry = device_registry.async_get_device(
-                    identifiers={(DOMAIN, self.entry.entry_id)}
-                )
-                _LOGGER.debug("Lookup by entry_id %s: found=%s", self.entry.entry_id, device_entry is not None)
-
-            if device_entry:
-                updates = {}
-                model = device_info.get("model_name")
-                sw_version = device_info.get("tv_version")
-                name = device_info.get("tv_name")
-
-                _LOGGER.debug("Device info - model: %s, sw_version: %s, name: %s",
-                             model, sw_version, name)
-
-                if model and model != device_entry.model:
-                    updates["model"] = model
-                if sw_version and sw_version != device_entry.sw_version:
-                    updates["sw_version"] = sw_version
-                if name and name != device_entry.name:
-                    updates["name"] = name
-
-                if updates:
-                    # Update the device in the registry
-                    device_registry.async_update_device(device_entry.id, **updates)
-                    _LOGGER.info("Updated device info for %s: %s", device_entry.id, updates)
-
-                    # Schedule a save to persist changes
-                    device_registry.async_schedule_save()
-
-                    # Also update the config entry data for future loads
-                    new_data = dict(self.entry.data)
-                    if model:
-                        new_data["model"] = model
-                    if sw_version:
-                        new_data["sw_version"] = sw_version
-                    if device_id:
-                        new_data["device_id"] = device_id
-                    self.hass.config_entries.async_update_entry(self.entry, data=new_data)
-                    _LOGGER.debug("Updated config entry data with device info")
-                else:
-                    _LOGGER.debug("No device info updates needed")
-            else:
-                _LOGGER.warning("Device not found in registry with id: %s", device_id)
-
-            self._device_info_fetched = True
-
+            info = await self.tv.async_get_device_info(timeout=5)
         except Exception as err:
-            _LOGGER.warning("Error fetching device info: %s", err)
+            _LOGGER.debug("Error fetching device info: %s", err)
+            return
+
+        if not info:
+            # Leave the flag unset so we retry on a later refresh (e.g. the TV
+            # was off during setup and comes online afterwards).
+            _LOGGER.debug("No device info returned from TV yet")
+            return
+
+        self.device_data = {
+            "model": info.get("model_name"),
+            "sw_version": info.get("tv_version"),
+            "name": info.get("tv_name"),
+            "ip": info.get("ip"),
+            # network_type is the device id (MAC without colons) per project convention.
+            "device_id": info.get("network_type"),
+        }
+        self._device_info_fetched = True
+        _LOGGER.debug("Cached device info: %s", self.device_data)
+
+        # Best-effort: if the device already exists (TV came online after setup),
+        # refresh it now so the user need not reload. If it doesn't exist yet
+        # (first refresh, before entity setup), that's fine — entity creation
+        # applies device_data via DeviceInfo.
+        device_registry = dr.async_get(self.hass)
+        identifier = self.entry.data.get(CONF_DEVICE_ID) or self.entry.entry_id
+        device_entry = device_registry.async_get_device(
+            identifiers={(DOMAIN, identifier)}
+        )
+        if device_entry:
+            updates = {}
+            if self.device_data["model"] and self.device_data["model"] != device_entry.model:
+                updates["model"] = self.device_data["model"]
+            if self.device_data["sw_version"] and self.device_data["sw_version"] != device_entry.sw_version:
+                updates["sw_version"] = self.device_data["sw_version"]
+            if updates:
+                device_registry.async_update_device(device_entry.id, **updates)
+                _LOGGER.debug("Refreshed existing device %s: %s", device_entry.id, updates)
 
     # Refresh the access token when it has less than this until expiry.
     _TOKEN_REFRESH_THRESHOLD = 24 * 60 * 60  # 1 day
@@ -211,8 +178,8 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Renew the access token before it lapses while connected.
             await self._async_maybe_refresh_token()
 
-            # Update device info on first successful connection
-            await self._async_update_device_info()
+            # Cache device info on first successful connection
+            await self._async_fetch_device_info()
 
             # Get current state
             state_start = time.monotonic()

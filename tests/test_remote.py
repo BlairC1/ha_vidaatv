@@ -71,3 +71,42 @@ async def test_turn_on_home_sends_home_key_not_launch() -> None:
 
     remote.coordinator.async_send_key.assert_awaited_once_with("KEY_HOME")
     remote.coordinator.async_launch_app.assert_not_called()
+
+
+def test_device_info_prefers_live_device_data() -> None:
+    """DeviceInfo surfaces the TV's model, firmware, name, MAC, and IP."""
+    from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC
+
+    remote = _make_remote({"is_on": True})
+    remote.coordinator.device_data = {
+        "model": "32A35HUV_0002",
+        "sw_version": "V0000.09.01O",
+        "name": "Bodhi's TV",
+        "ip": "10.0.0.162",
+        "device_id": "001122334455",
+    }
+
+    info = remote.device_info
+    assert info["model"] == "32A35HUV_0002"
+    assert info["sw_version"] == "V0000.09.01O"
+    assert info["name"] == "Bodhi's TV"
+    assert info["configuration_url"] == "http://10.0.0.162"
+    assert (CONNECTION_NETWORK_MAC, "00:11:22:33:44:55") in info["connections"]
+
+
+def test_device_info_falls_back_to_entry_data() -> None:
+    """With no live device_data yet, fall back to the config entry values."""
+    remote = _make_remote({"is_on": True})
+    remote.coordinator.device_data = {}
+    remote._entry.data = {
+        "device_id": "001122334455",
+        "name": "Configured Name",
+        "model": "EntryModel",
+        "sw_version": "EntrySW",
+    }
+
+    info = remote.device_info
+    assert info["model"] == "EntryModel"
+    assert info["sw_version"] == "EntrySW"
+    assert info["name"] == "Configured Name"
+    assert "configuration_url" not in info
