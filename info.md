@@ -45,4 +45,4 @@ data:
 
 ## Documentation
 
-See the [full documentation](https://github.com/warrenrees/pyvidaa/blob/main/custom_components/vidaa_tv/README.md) for detailed setup and configuration options.
+See the [full documentation](https://github.com/warrenrees/ha_vidaatv/blob/main/README.md) for detailed setup and configuration options.
