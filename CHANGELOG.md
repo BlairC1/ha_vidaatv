@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 (Library/protocol changes are tracked separately in the [`pyvidaa`](https://github.com/warrenrees/pyvidaa) repository.)
 
+## [2.0.1]
+
+### Fixed
+
+- The device now shows the TV's model, firmware version, IP, and MAC. The coordinator caches
+  `getdeviceinfo` and the entities build their `DeviceInfo` from it; previously the info was
+  fetched during the first refresh (before the device existed in the registry) and never
+  applied, so model/firmware stayed blank.
+- Pairing no longer re-prompts for a PIN when the TV is briefly slow to return device info
+  after a successful authentication. `getdeviceinfo` is retried, and a miss is treated as
+  non-fatal — the entry is created and device info is fetched after setup.
+
 ## [2.0.0]
 
 Initial release of the Vidaa TV integration as a standalone repository, split out of the
@@ -20,10 +32,3 @@ communication.
   and repair flows.
 - VIDAA brand images (icon/logo) via the local `brand/` folder (HA 2026.3+).
 - Remote: shows "Home" as the current activity when the TV is at the launcher.
-
-### Fixed
-
-- The device now shows the TV's model, firmware version, IP, and MAC. The coordinator caches
-  `getdeviceinfo` and the entities build their `DeviceInfo` from it; previously the info was
-  fetched during the first refresh (before the device existed in the registry) and never
-  applied, so model/firmware stayed blank.
