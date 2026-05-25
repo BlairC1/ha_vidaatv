@@ -1,0 +1,5 @@
+# Test dependencies for the Vidaa TV Home Assistant integration.
+# pytest-homeassistant-custom-component pins a specific Home Assistant
+# version; bump it to match the HA version you target.
+pytest-homeassistant-custom-component
+pyvidaa
