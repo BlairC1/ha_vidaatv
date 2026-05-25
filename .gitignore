@@ -20,3 +20,5 @@ htmlcov/
 *.swp
 .idea/
 .vscode/
+
+CLAUDE.md
