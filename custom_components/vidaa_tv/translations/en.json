@@ -38,7 +38,6 @@
       "certs_not_found": "Certificate files not found. Please check the paths and ensure the files exist.",
       "invalid_pin": "Invalid PIN. Please check the PIN on your TV and try again.",
       "pairing_failed": "Pairing failed. Please try again.",
-      "auth_verify_failed": "Authentication succeeded but could not verify. Please try again.",
       "unknown": "An unexpected error occurred."
     },
     "abort": {

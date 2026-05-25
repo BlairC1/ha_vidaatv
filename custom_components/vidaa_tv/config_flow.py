@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import random
@@ -445,54 +446,62 @@ class VidaaTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     success = await tv.async_authenticate(pin, timeout=10)
 
                     if success:
-                        # Verify we're actually authenticated by getting device info
-                        device_info = await tv.async_get_device_info(timeout=5)
+                        # The TV is often slow to answer getdeviceinfo right after
+                        # accepting the PIN, so retry briefly. A miss is NOT fatal:
+                        # auth already succeeded and the coordinator fetches device
+                        # info again after setup.
+                        device_info = None
+                        for _attempt in range(3):
+                            device_info = await tv.async_get_device_info(timeout=5)
+                            if device_info:
+                                break
+                            await asyncio.sleep(1)
                         await tv.async_disconnect()
 
                         if device_info:
-                            # Update device info from successful connection
                             self._device_id = device_info.get("network_type") or self._device_id
                             self._model = device_info.get("model_name") or self._model
                             self._sw_version = device_info.get("tv_version") or self._sw_version
                             if device_info.get("tv_name"):
                                 self._name = device_info.get("tv_name")
+                        else:
+                            _LOGGER.warning(
+                                "Auth succeeded but device info was not returned yet; "
+                                "continuing - the integration will fetch it after setup"
+                            )
 
-                            new_data = {
-                                CONF_HOST: self._host,
-                                CONF_PORT: self._port,
-                                CONF_NAME: self._name,
-                                CONF_DEVICE_ID: self._device_id,
-                                CONF_MAC: self._mac,  # New MAC used for auth
-                                CONF_MODEL: self._model,
-                                CONF_BRAND: self._brand or "his",
-                                CONF_SW_VERSION: self._sw_version,
-                                CONF_CERTFILE: self._certfile,
-                                CONF_KEYFILE: self._keyfile,
-                            }
+                        new_data = {
+                            CONF_HOST: self._host,
+                            CONF_PORT: self._port,
+                            CONF_NAME: self._name,
+                            CONF_DEVICE_ID: self._device_id,
+                            CONF_MAC: self._mac,  # New MAC used for auth
+                            CONF_MODEL: self._model,
+                            CONF_BRAND: self._brand or "his",
+                            CONF_SW_VERSION: self._sw_version,
+                            CONF_CERTFILE: self._certfile,
+                            CONF_KEYFILE: self._keyfile,
+                        }
 
-                            # Handle reauth - update existing entry
-                            if self.source == config_entries.SOURCE_REAUTH:
-                                return self.async_update_reload_and_abort(
-                                    self._get_reauth_entry(),
-                                    data=new_data,
-                                )
-
-                            # Set unique ID to prevent duplicates
-                            if self._device_id:
-                                await self.async_set_unique_id(self._device_id)
-                                self._abort_if_unique_id_configured(
-                                    updates={CONF_HOST: self._host, CONF_PORT: self._port}
-                                )
-
-                            # Create the config entry
-                            return self.async_create_entry(
-                                title=self._name,
+                        # Handle reauth - update existing entry
+                        if self.source == config_entries.SOURCE_REAUTH:
+                            return self.async_update_reload_and_abort(
+                                self._get_reauth_entry(),
                                 data=new_data,
                             )
-                        else:
-                            # Auth seemed to succeed but can't verify
-                            _LOGGER.warning("Auth succeeded but could not get device info")
-                            errors["base"] = "auth_verify_failed"
+
+                        # Set unique ID to prevent duplicates
+                        if self._device_id:
+                            await self.async_set_unique_id(self._device_id)
+                            self._abort_if_unique_id_configured(
+                                updates={CONF_HOST: self._host, CONF_PORT: self._port}
+                            )
+
+                        # Create the config entry
+                        return self.async_create_entry(
+                            title=self._name,
+                            data=new_data,
+                        )
                     else:
                         await tv.async_disconnect()
                         errors["base"] = "invalid_pin"
@@ -522,7 +531,6 @@ class VidaaTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if connected:
                 await tv.async_start_pairing()
                 # Keep connection open briefly for PIN to appear
-                import asyncio
                 await asyncio.sleep(1)
                 await tv.async_disconnect()
                 pin_shown = True
