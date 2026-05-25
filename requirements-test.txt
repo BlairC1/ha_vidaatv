@@ -3,3 +3,5 @@
 # version; bump it to match the HA version you target.
 pytest-homeassistant-custom-component
 pyvidaa
+# Required by homeassistant.components.ssdp (used by the config flow)
+async-upnp-client
