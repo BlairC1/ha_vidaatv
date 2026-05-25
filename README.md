@@ -1,4 +1,4 @@
-# Hisense TV Integration for Home Assistant
+# Vidaa TV Integration for Home Assistant
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
 [![GitHub Release](https://img.shields.io/github/v/release/warrenrees/ha_vidaatv)](https://github.com/warrenrees/ha_vidaatv/releases)
@@ -35,7 +35,7 @@ This integration supports Hisense and Vidaa Smart TVs that use MQTT for remote c
 4. Add the repository URL: `https://github.com/warrenrees/ha_vidaatv`
 5. Select "Integration" as the category
 6. Click "Add"
-7. Search for "Hisense TV" in HACS and install it
+7. Search for "Vidaa TV" in HACS and install it
 8. Restart Home Assistant
 
 ### Manual Installation
@@ -60,7 +60,7 @@ This integration supports Hisense and Vidaa Smart TVs that use MQTT for remote c
 
 1. Go to **Settings** → **Devices & Services**
 2. Click **+ Add Integration**
-3. Search for "Hisense TV"
+3. Search for "Vidaa TV"
 4. Enter your TV's IP address
 5. A PIN will appear on your TV screen
 6. Enter the PIN in Home Assistant
