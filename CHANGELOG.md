@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pairing no longer re-prompts for a PIN when the TV is briefly slow to return device info
   after a successful authentication. `getdeviceinfo` is retried, and a miss is treated as
   non-fatal — the entry is created and device info is fetched after setup.
+- The integration now sets up even when the TV is unreachable (e.g. in deep sleep). Previously
+  setup failed with `ConfigEntryNotReady`, so the entities — including the power button that
+  sends Wake-on-LAN — were never created and the TV couldn't be woken from Home Assistant.
+  The coordinator reconnects on a later poll once the TV is on.
 
 ### Changed
 

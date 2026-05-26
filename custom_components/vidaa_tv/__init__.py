@@ -11,7 +11,7 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError, ServiceValidationError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.device_registry import DeviceEntry
 from homeassistant.helpers.typing import ConfigType
@@ -84,18 +84,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: VidaaTVConfigEntry) -> b
         enable_persistence=True,
     )
 
-    # Try to connect
+    # Best-effort connect. The TV may be in deep sleep (Wake-on-LAN) — don't block
+    # setup on it, or the entities (including the power button that sends WoL) would
+    # never be created and the TV couldn't be turned on from Home Assistant.
     try:
-        connected = await tv.async_connect(timeout=10)
-        if not connected:
-            raise ConfigEntryNotReady(f"Failed to connect to TV at {host}")
+        if not await tv.async_connect(timeout=10):
+            _LOGGER.warning(
+                "TV at %s is not reachable (it may be off); setting up anyway so it "
+                "can be woken from Home Assistant", host
+            )
     except Exception as err:
-        _LOGGER.error("Error connecting to TV: %s", err)
-        raise ConfigEntryNotReady(f"Error connecting to TV: {err}") from err
+        _LOGGER.warning("Initial connect to TV at %s failed (it may be off): %s", host, err)
 
-    # Create coordinator for data updates
+    # Create coordinator for data updates. Use async_refresh (not
+    # async_config_entry_first_refresh) so an unreachable TV doesn't abort setup;
+    # the coordinator reconnects on a later poll once the TV is on.
     coordinator = VidaaTVDataUpdateCoordinator(hass, tv, entry)
-    await coordinator.async_config_entry_first_refresh()
+    await coordinator.async_refresh()
 
     # Store runtime data using the modern pattern
     entry.runtime_data = VidaaTVRuntimeData(coordinator=coordinator, tv=tv)

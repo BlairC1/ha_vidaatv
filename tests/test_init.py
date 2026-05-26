@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
 
 from custom_components.vidaa_tv import (
     async_setup,
@@ -49,11 +48,11 @@ async def test_async_setup_entry_success(
     assert entry.runtime_data.tv is not None
 
 
-async def test_async_setup_entry_connection_failed(
+async def test_async_setup_entry_loads_when_tv_offline(
     hass: HomeAssistant,
     mock_vidaa_tv_offline: MagicMock,
 ) -> None:
-    """Test entry setup when TV connection fails."""
+    """A TV in deep sleep must still set up so the WoL power button exists."""
     entry = create_mock_config_entry(hass)
     entry.add_to_hass(hass)
 
@@ -64,9 +63,11 @@ async def test_async_setup_entry_connection_failed(
         await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-    # Entry should be in setup_retry state due to ConfigEntryNotReady
+    # Entry loads even though the TV is unreachable; the coordinator just reports
+    # the last update as unsuccessful until the TV comes online.
     from homeassistant.config_entries import ConfigEntryState
-    assert entry.state == ConfigEntryState.SETUP_RETRY
+    assert entry.state is ConfigEntryState.LOADED
+    assert entry.runtime_data.coordinator.last_update_success is False
 
 
 async def test_async_unload_entry(
