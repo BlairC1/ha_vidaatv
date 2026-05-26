@@ -44,6 +44,7 @@ async def async_get_config_entry_diagnostics(
         },
         "coordinator": {
             "data": coordinator.data,
+            "device_data": async_redact_data(coordinator.device_data, TO_REDACT),
             "available": coordinator.available,
             "last_update_success": coordinator.last_update_success,
             "update_interval": str(coordinator.update_interval),

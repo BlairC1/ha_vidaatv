@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after a successful authentication. `getdeviceinfo` is retried, and a miss is treated as
   non-fatal — the entry is created and device info is fetched after setup.
 
+### Changed
+
+- Diagnostics now include the coordinator's cached `device_data` (model, firmware, IP) so the
+  device info the integration resolved is visible.
+
 ## [2.0.0]
 
 Initial release of the Vidaa TV integration as a standalone repository, split out of the
