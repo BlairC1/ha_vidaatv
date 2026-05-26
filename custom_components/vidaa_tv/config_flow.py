@@ -432,16 +432,29 @@ class VidaaTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 auth_elapsed = time.monotonic() - auth_start
 
                 if success:
-                    # The TV is often slow to answer getdeviceinfo right after
-                    # accepting the PIN, so retry briefly. A miss is NOT fatal:
-                    # auth already succeeded and the coordinator fetches device
-                    # info again after setup.
+                    # The PIN-authed connection usually won't answer
+                    # getdeviceinfo (the TV only serves it on a token-authed
+                    # session). Reconnect with the token we just persisted -
+                    # the same session the coordinator uses - and fetch there.
+                    #
+                    # Capturing device_id HERE matters: the entity unique_ids
+                    # and the device registry identifier are derived from it.
+                    # If the entry is created without it they fall back to the
+                    # entry_id, and backfilling device_id later would change
+                    # those identifiers and orphan the device/entities. A miss
+                    # is still not fatal - we fall back to entry_id and the
+                    # coordinator surfaces model/firmware from its own fetch.
                     device_info = None
-                    for _attempt in range(3):
-                        device_info = await tv.async_get_device_info(timeout=5)
-                        if device_info:
-                            break
-                        await asyncio.sleep(1)
+                    try:
+                        await tv.async_reset()
+                        if await tv.async_connect(timeout=TIMEOUT_CONNECT):
+                            for _attempt in range(3):
+                                device_info = await tv.async_get_device_info(timeout=5)
+                                if device_info:
+                                    break
+                                await asyncio.sleep(1)
+                    except Exception as err:  # noqa: BLE001 - best effort
+                        _LOGGER.debug("Post-auth device info fetch failed: %s", err)
                     await tv.async_disconnect()
                     self._pairing_tv = None
 
