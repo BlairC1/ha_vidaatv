@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Device info is re-fetched on reconnect, so a firmware update (which reboots the TV) is
+  reflected in the device's firmware version without an integration reload.
 - Diagnostics now include the coordinator's cached `device_data` (model, firmware, IP) so the
   device info the integration resolved is visible.
 

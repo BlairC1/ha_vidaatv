@@ -172,6 +172,9 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self._available = False
                     raise UpdateFailed("Failed to connect to TV")
                 _LOGGER.debug("Reconnect took %.2fs", time.monotonic() - start)
+                # A reconnect can mean the TV rebooted (e.g. a firmware update),
+                # so re-fetch device info to pick up a new firmware version.
+                self._device_info_fetched = False
 
             self._available = True
 
