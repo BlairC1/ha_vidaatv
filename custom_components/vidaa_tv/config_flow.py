@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import random
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -442,8 +443,12 @@ class VidaaTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 if not connected:
                     errors["base"] = "cannot_connect"
                 else:
-                    # Authenticate with PIN
+                    # Authenticate with PIN. Time it so we can tell a rejected PIN
+                    # (the TV answers quickly) from no response at all (the PIN
+                    # screen likely expired or the TV stopped answering).
+                    auth_start = time.monotonic()
                     success = await tv.async_authenticate(pin, timeout=10)
+                    auth_elapsed = time.monotonic() - auth_start
 
                     if success:
                         # The TV is often slow to answer getdeviceinfo right after
@@ -503,8 +508,21 @@ class VidaaTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             data=new_data,
                         )
                     else:
+                        # is_authenticated distinguishes "PIN accepted but no
+                        # token" from a plain rejection; timing distinguishes a
+                        # rejection (fast) from no response (~full timeout).
+                        authed = tv.is_authenticated
                         await tv.async_disconnect()
-                        errors["base"] = "invalid_pin"
+                        if not authed and auth_elapsed < 8:
+                            _LOGGER.warning("TV rejected the PIN")
+                            errors["base"] = "invalid_pin"
+                        else:
+                            _LOGGER.warning(
+                                "No authentication response from TV after %.1fs "
+                                "(PIN may have expired or the TV stopped responding)",
+                                auth_elapsed,
+                            )
+                            errors["base"] = "no_auth_response"
 
             except Exception as err:
                 _LOGGER.exception("Error during pairing: %s", err)

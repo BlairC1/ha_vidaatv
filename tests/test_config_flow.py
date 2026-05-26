@@ -165,8 +165,9 @@ async def test_pair_flow_invalid_pin(
     mock_certs_exist: MagicMock,
 ) -> None:
     """Test pairing flow with invalid PIN."""
-    # Set up the mock to reject authentication
+    # Set up the mock to reject authentication (TV answered, PIN was wrong)
     mock_config_flow_tv.async_authenticate = AsyncMock(return_value=False)
+    mock_config_flow_tv.is_authenticated = False
 
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
@@ -187,6 +188,35 @@ async def test_pair_flow_invalid_pin(
 
     assert result["type"] == FlowResultType.FORM
     assert result["errors"]["base"] == "invalid_pin"
+
+
+async def test_pair_flow_no_auth_response(
+    hass: HomeAssistant,
+    mock_config_flow_tv: MagicMock,
+    mock_certs_exist: MagicMock,
+) -> None:
+    """A non-rejection failure (no/partial auth response) reports no_auth_response."""
+    # authenticate fails but the client reports it got authenticated (PIN accepted
+    # but token never arrived) -> treated as "no auth response", not a wrong PIN.
+    mock_config_flow_tv.async_authenticate = AsyncMock(return_value=False)
+    mock_config_flow_tv.is_authenticated = True
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_HOST: "192.168.1.100"},
+    )
+    assert result["step_id"] == "pair"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {"pin": "1234"},
+    )
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"]["base"] == "no_auth_response"
 
 
 async def test_options_flow(

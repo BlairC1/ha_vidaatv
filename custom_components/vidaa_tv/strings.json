@@ -37,6 +37,7 @@
       "cannot_connect": "Failed to connect to TV. Make sure the TV is on and reachable.",
       "certs_not_found": "Certificate files not found. Please check the paths and ensure the files exist.",
       "invalid_pin": "Invalid PIN. Please check the PIN on your TV and try again.",
+      "no_auth_response": "The TV did not respond to the PIN - it may have expired. Make sure the PIN is still shown on the TV (reboot the TV if it isn't), then try again.",
       "pairing_failed": "Pairing failed. Please try again.",
       "unknown": "An unexpected error occurred."
     },
