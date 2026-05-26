@@ -267,10 +267,15 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_turn_on(self) -> None:
         """Turn TV on using WoL and power command."""
-        # Resolve the WoL target MAC: explicit wol_mac option wins, else the
-        # TV's hardware MAC stored as device_id. Normalize to bare hex so a
-        # colon/dash-formatted value still works.
-        raw_mac = self.entry.options.get("wol_mac") or self.entry.data.get(CONF_DEVICE_ID)
+        # Resolve the WoL target MAC: explicit wol_mac option wins, else the TV's
+        # hardware MAC stored as device_id (config entry, or the value cached from
+        # getdeviceinfo once the TV has been seen online). Normalize to bare hex so
+        # a colon/dash-formatted value still works.
+        raw_mac = (
+            self.entry.options.get("wol_mac")
+            or self.entry.data.get(CONF_DEVICE_ID)
+            or self.device_data.get("device_id")
+        )
         normalized = (raw_mac or "").replace(":", "").replace("-", "").lower()
         if len(normalized) == 12 and all(c in "0123456789abcdef" for c in normalized):
             mac = ":".join(normalized[i:i+2] for i in range(0, 12, 2))

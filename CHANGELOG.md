@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   setup failed with `ConfigEntryNotReady`, so the entities — including the power button that
   sends Wake-on-LAN — were never created and the TV couldn't be woken from Home Assistant.
   The coordinator reconnects on a later poll once the TV is on.
+- Wake-on-LAN now also uses the TV's hardware MAC cached from `getdeviceinfo` (not just the
+  config entry's `device_id`), so the power button can wake a TV that has been seen online this
+  session even when the entry never stored a MAC. (If the entry has no MAC and the TV hasn't
+  been reached since the last restart, set a `wol_mac` in the integration options.)
 
 ### Changed
 
