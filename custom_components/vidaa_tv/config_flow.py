@@ -163,6 +163,10 @@ class VidaaTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._discovery_info: ssdp.SsdpServiceInfo | None = None
         self._certfile: str | None = None
         self._keyfile: str | None = None
+        # The connected client that triggered the PIN dialog. The TV ties the
+        # pairing session to this one MQTT connection, so authenticate() must
+        # run on it - reconnecting with a fresh client loses the session.
+        self._pairing_tv: AsyncVidaaTV | None = None
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -411,11 +415,117 @@ class VidaaTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Handle pairing step (PIN entry)."""
         errors: dict[str, str] = {}
 
-        if user_input is not None:
+        if user_input is not None and self._pairing_tv is not None:
             pin = user_input.get("pin", "")
 
-            # brand is an auth input. SSDP discovery already captured it from the
-            # descriptor; for the manual entry path, probe the TV's UPnP descriptor.
+            # Authenticate on the SAME connection that triggered the PIN. The TV
+            # binds the pairing session to that MQTT connection, so a fresh
+            # client here would just time out (the session would be gone).
+            tv = self._pairing_tv
+
+            try:
+                # Time the auth so we can tell a rejected PIN (the TV answers
+                # quickly) from no response at all (the PIN screen likely
+                # expired or the TV stopped answering).
+                auth_start = time.monotonic()
+                success = await tv.async_authenticate(pin, timeout=10)
+                auth_elapsed = time.monotonic() - auth_start
+
+                if success:
+                    # The TV is often slow to answer getdeviceinfo right after
+                    # accepting the PIN, so retry briefly. A miss is NOT fatal:
+                    # auth already succeeded and the coordinator fetches device
+                    # info again after setup.
+                    device_info = None
+                    for _attempt in range(3):
+                        device_info = await tv.async_get_device_info(timeout=5)
+                        if device_info:
+                            break
+                        await asyncio.sleep(1)
+                    await tv.async_disconnect()
+                    self._pairing_tv = None
+
+                    if device_info:
+                        self._device_id = device_info.get("network_type") or self._device_id
+                        self._model = device_info.get("model_name") or self._model
+                        self._sw_version = device_info.get("tv_version") or self._sw_version
+                        if device_info.get("tv_name"):
+                            self._name = device_info.get("tv_name")
+                    else:
+                        _LOGGER.warning(
+                            "Auth succeeded but device info was not returned yet; "
+                            "continuing - the integration will fetch it after setup"
+                        )
+
+                    new_data = {
+                        CONF_HOST: self._host,
+                        CONF_PORT: self._port,
+                        CONF_NAME: self._name,
+                        CONF_DEVICE_ID: self._device_id,
+                        CONF_MAC: self._mac,  # New MAC used for auth
+                        CONF_MODEL: self._model,
+                        CONF_BRAND: self._brand or "his",
+                        CONF_SW_VERSION: self._sw_version,
+                        CONF_CERTFILE: self._certfile,
+                        CONF_KEYFILE: self._keyfile,
+                    }
+
+                    # Handle reauth - update existing entry
+                    if self.source == config_entries.SOURCE_REAUTH:
+                        return self.async_update_reload_and_abort(
+                            self._get_reauth_entry(),
+                            data=new_data,
+                        )
+
+                    # Set unique ID to prevent duplicates
+                    if self._device_id:
+                        await self.async_set_unique_id(self._device_id)
+                        self._abort_if_unique_id_configured(
+                            updates={CONF_HOST: self._host, CONF_PORT: self._port}
+                        )
+
+                    # Create the config entry
+                    return self.async_create_entry(
+                        title=self._name,
+                        data=new_data,
+                    )
+
+                # Auth failed. Drop the (now stale) session; the block below
+                # re-triggers a fresh PIN so the user can try again.
+                # is_authenticated distinguishes "PIN accepted but no token"
+                # from a plain rejection; timing distinguishes a rejection
+                # (fast) from no response (~full timeout).
+                authed = tv.is_authenticated
+                await tv.async_disconnect()
+                self._pairing_tv = None
+                if not authed and auth_elapsed < 8:
+                    _LOGGER.warning("TV rejected the PIN")
+                    errors["base"] = "invalid_pin"
+                else:
+                    _LOGGER.warning(
+                        "No authentication response from TV after %.1fs "
+                        "(PIN may have expired or the TV stopped responding)",
+                        auth_elapsed,
+                    )
+                    errors["base"] = "no_auth_response"
+
+            except Exception as err:
+                _LOGGER.exception("Error during pairing: %s", err)
+                errors["base"] = "pairing_failed"
+                try:
+                    await tv.async_disconnect()
+                except Exception:
+                    pass
+                self._pairing_tv = None
+
+        # Trigger the PIN dialog and KEEP the connection open so authenticate()
+        # (on the next form submission) runs on the same session. We only do
+        # this when there's no live pairing session - i.e. on first entry or
+        # after a failed attempt that needs a fresh PIN.
+        if self._pairing_tv is None:
+            # brand is an auth input. SSDP discovery already captured it from
+            # the descriptor; for the manual entry path, probe the TV's UPnP
+            # descriptor before connecting.
             if not self._brand and self._host:
                 try:
                     device = await self.hass.async_add_executor_job(
@@ -426,7 +536,6 @@ class VidaaTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 except Exception as err:  # noqa: BLE001 - best effort, falls back to "his"
                     _LOGGER.debug("Could not probe brand for %s: %s", self._host, err)
 
-            # Create TV client for pairing
             tv = AsyncVidaaTV(
                 host=self._host,
                 port=self._port,
@@ -438,130 +547,31 @@ class VidaaTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 enable_persistence=True,
             )
 
+            pin_shown = False
             try:
                 connected = await tv.async_connect(timeout=TIMEOUT_CONNECT)
-                if not connected:
-                    errors["base"] = "cannot_connect"
+                if connected:
+                    await tv.async_start_pairing()
+                    # Keep connection open briefly for PIN to appear
+                    await asyncio.sleep(1)
+                    # Hold the connection for the authenticate step.
+                    self._pairing_tv = tv
+                    pin_shown = True
                 else:
-                    # Authenticate with PIN. Time it so we can tell a rejected PIN
-                    # (the TV answers quickly) from no response at all (the PIN
-                    # screen likely expired or the TV stopped answering).
-                    auth_start = time.monotonic()
-                    success = await tv.async_authenticate(pin, timeout=10)
-                    auth_elapsed = time.monotonic() - auth_start
-
-                    if success:
-                        # The TV is often slow to answer getdeviceinfo right after
-                        # accepting the PIN, so retry briefly. A miss is NOT fatal:
-                        # auth already succeeded and the coordinator fetches device
-                        # info again after setup.
-                        device_info = None
-                        for _attempt in range(3):
-                            device_info = await tv.async_get_device_info(timeout=5)
-                            if device_info:
-                                break
-                            await asyncio.sleep(1)
-                        await tv.async_disconnect()
-
-                        if device_info:
-                            self._device_id = device_info.get("network_type") or self._device_id
-                            self._model = device_info.get("model_name") or self._model
-                            self._sw_version = device_info.get("tv_version") or self._sw_version
-                            if device_info.get("tv_name"):
-                                self._name = device_info.get("tv_name")
-                        else:
-                            _LOGGER.warning(
-                                "Auth succeeded but device info was not returned yet; "
-                                "continuing - the integration will fetch it after setup"
-                            )
-
-                        new_data = {
-                            CONF_HOST: self._host,
-                            CONF_PORT: self._port,
-                            CONF_NAME: self._name,
-                            CONF_DEVICE_ID: self._device_id,
-                            CONF_MAC: self._mac,  # New MAC used for auth
-                            CONF_MODEL: self._model,
-                            CONF_BRAND: self._brand or "his",
-                            CONF_SW_VERSION: self._sw_version,
-                            CONF_CERTFILE: self._certfile,
-                            CONF_KEYFILE: self._keyfile,
-                        }
-
-                        # Handle reauth - update existing entry
-                        if self.source == config_entries.SOURCE_REAUTH:
-                            return self.async_update_reload_and_abort(
-                                self._get_reauth_entry(),
-                                data=new_data,
-                            )
-
-                        # Set unique ID to prevent duplicates
-                        if self._device_id:
-                            await self.async_set_unique_id(self._device_id)
-                            self._abort_if_unique_id_configured(
-                                updates={CONF_HOST: self._host, CONF_PORT: self._port}
-                            )
-
-                        # Create the config entry
-                        return self.async_create_entry(
-                            title=self._name,
-                            data=new_data,
-                        )
-                    else:
-                        # is_authenticated distinguishes "PIN accepted but no
-                        # token" from a plain rejection; timing distinguishes a
-                        # rejection (fast) from no response (~full timeout).
-                        authed = tv.is_authenticated
-                        await tv.async_disconnect()
-                        if not authed and auth_elapsed < 8:
-                            _LOGGER.warning("TV rejected the PIN")
-                            errors["base"] = "invalid_pin"
-                        else:
-                            _LOGGER.warning(
-                                "No authentication response from TV after %.1fs "
-                                "(PIN may have expired or the TV stopped responding)",
-                                auth_elapsed,
-                            )
-                            errors["base"] = "no_auth_response"
-
+                    errors["base"] = "cannot_connect"
+                    await tv.async_disconnect()
             except Exception as err:
-                _LOGGER.exception("Error during pairing: %s", err)
-                errors["base"] = "pairing_failed"
+                _LOGGER.warning("Could not trigger PIN dialog: %s", err)
+                errors["base"] = "cannot_connect"
                 try:
                     await tv.async_disconnect()
                 except Exception:
                     pass
 
-        # Show PIN dialog on TV
-        tv = AsyncVidaaTV(
-            host=self._host,
-            port=self._port,
-            certfile=self._certfile,
-            keyfile=self._keyfile,
-            use_dynamic_auth=True,
-            mac_address=self._mac,
-            enable_persistence=False,
-        )
-
-        pin_shown = False
-        try:
-            connected = await tv.async_connect(timeout=TIMEOUT_CONNECT)
-            if connected:
-                await tv.async_start_pairing()
-                # Keep connection open briefly for PIN to appear
-                await asyncio.sleep(1)
-                await tv.async_disconnect()
-                pin_shown = True
-            else:
-                errors["base"] = "cannot_connect"
-        except Exception as err:
-            _LOGGER.warning("Could not trigger PIN dialog: %s", err)
-            errors["base"] = "cannot_connect"
-
-        # Only show PIN form if we successfully triggered the dialog
-        if not pin_shown and not user_input:
-            # Can't show PIN on TV - abort with helpful message
-            return self.async_abort(reason="tv_not_responding")
+            # Only show PIN form if we successfully triggered the dialog
+            if not pin_shown and not user_input:
+                # Can't show PIN on TV - abort with helpful message
+                return self.async_abort(reason="tv_not_responding")
 
         return self.async_show_form(
             step_id="pair",
