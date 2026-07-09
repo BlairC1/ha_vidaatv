@@ -128,7 +128,12 @@ async def validate_connection(
         if device_info:
             result["name"] = device_info.get("tv_name", DEFAULT_NAME)
             result["model"] = device_info.get("model_name")
-            result["device_id"] = device_info.get("network_type")
+            result["device_id"] = (
+                tv_info.get("deviceid")
+                or device_info.get("wifi_mac")
+                or device_info.get("mac")
+                or self._host
+                )
             result["sw_version"] = device_info.get("tv_version")
 
         if tv_info:
