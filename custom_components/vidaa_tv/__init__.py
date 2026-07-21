@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 from dataclasses import dataclass
 from typing import Any
 
@@ -53,6 +54,11 @@ type VidaaTVConfigEntry = ConfigEntry[VidaaTVRuntimeData]
 
 CONFIG_SCHEMA = cv.empty_config_schema(DOMAIN)
 
+def _stable_mac(seed: str) -> str:
+    digest = hashlib.sha256(seed.encode()).digest()
+    # First octet 0x02 => locally administered, unicast.
+    return "02:" + ":".join(f"{b:02X}" for b in digest[:5])
+
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the Hisense TV integration."""
@@ -78,7 +84,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: VidaaTVConfigEntry) -> b
         port=port,
         certfile=certfile,
         keyfile=keyfile,
-        mac_address=mac or device_id,
+        mac_address=mac or device_id or _stable_mac(entry.entry_id),
         use_dynamic_auth=True,
         brand=brand,
         enable_persistence=True,
