@@ -157,7 +157,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         try:
             # Check connection
-            if not self.tv.is_connected or str((self.data or {}).get("statetype") or "").startswith("fake_sleep"):
+            if not self.tv.is_connected:
                 _LOGGER.debug("TV disconnected, rebuilding client and reconnecting")
                 # Rebuild the client so saved-token status is re-evaluated; an
                 # expired access token is then refreshed from the refresh token
