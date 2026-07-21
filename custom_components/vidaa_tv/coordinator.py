@@ -58,6 +58,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._available = True
         self._device_info_fetched = False
         self._auth_failures = 0
+        self._last_resync = 0.0
         # Parsed device info (model, sw_version, name, ip, device_id) cached from
         # the TV's getdeviceinfo; entities build their DeviceInfo from this.
         self.device_data: dict[str, Any] = {}
@@ -152,7 +153,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from TV."""
-        import time
+        import asyncio, time
         start = time.monotonic()
 
         try:
@@ -175,6 +176,8 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # A reconnect can mean the TV rebooted (e.g. a firmware update),
                 # so re-fetch device info to pick up a new firmware version.
                 self._device_info_fetched = False
+                self._last_resync = time.monotonic()
+                await asyncio.sleep(3)  # wait for the TV's connect-push before reading state
 
             self._available = True
 
@@ -184,6 +187,26 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Cache device info on first successful connection
             await self._async_fetch_device_info()
 
+            # --- Timed resync: catch state changes missed while connected --------
+            # (e.g. the one-shot broadcast the TV sends at power-on). The TV won't
+            # answer gettvstate, but it re-pushes current state ~3s after a connect,
+            # so periodically reconnect and wait for that push. Throttled by
+            # RESYNC_SECONDS; the stable MAC keeps each reconnect clean.
+            RESYNC_SECONDS = 90  # tune: lower = snappier power-on detection, more reconnects
+            now_mono = time.monotonic()
+            if self.tv.is_connected and (now_mono - self._last_resync) >= RESYNC_SECONDS:
+                self._last_resync = now_mono
+                _LOGGER.debug("Periodic resync: reconnecting to trigger the TV state push")
+                try:
+                    await self.tv.async_reset()
+                    if await self.tv.async_connect(timeout=5):
+                        await asyncio.sleep(3)  # let the connect-push refresh cached state
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.debug("Resync reconnect failed; keeping last state: %s", err)
+            # --- end timed resync ------------------------------------------------
+            
+
+            
             # Get current state
             state_start = time.monotonic()
             state = await self.tv.async_get_state(timeout=3)
