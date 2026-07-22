@@ -40,6 +40,7 @@ _LOGGER = logging.getLogger(__name__)
 # Import from PyPI package (pyvidaa)
 from pyvidaa import AsyncVidaaTV
 from pyvidaa.config import get_storage
+from pyvidaa.protocol import AuthMethod
 
 
 @dataclass
