@@ -87,6 +87,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: VidaaTVConfigEntry) -> b
         keyfile=keyfile,
         mac_address=mac or device_id or _stable_mac(entry.entry_id),
         use_dynamic_auth=True,
+        auth_method=AuthMethod.MODERN,   # skip the ~32s blocking UPnP probe on every reconnect
         brand=brand,
         enable_persistence=True,
     )
