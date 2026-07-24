@@ -348,17 +348,11 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             except Exception as err:
                 _LOGGER.debug("get_volume failed: %s", err)
 
+            # NOTE: volume broadcasts are NOT a power signal. Measured on both
+            # TVs while OFF: statetype=fake_sleep_0 yet volume_answered=True, i.e.
+            # a TV in standby still answers getvolume. Do not use this to infer
+            # power state - it only ever produced false "on".
             volume_answered = self._live_volume_ts > probe_before
-            if volume_answered:
-                # A TV in standby does not emit volume broadcasts, so this is a
-                # positive power signal. Additive only: it can promote to on, never
-                # demote, so a wrong guess here cannot make the state worse.
-                if not is_on:
-                    _LOGGER.debug(
-                        "Volume broadcast received; treating TV as on "
-                        "(cached statetype was %s)", state.get("statetype") if state else None,
-                    )
-                is_on = True
 
             if self._live_volume is not None:
                 volume = self._live_volume
