@@ -129,9 +129,18 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.debug("Refreshed existing device %s: %s", device_entry.id, updates)
 
     # Safety cap on emulated volume stepping (see async_set_volume).
-    _MAX_VOLUME_STEPS = 200      # safety cap (0.5-step amps need ~2 presses per unit)
-    _VOLUME_STEP_DELAY = 0.20    # wait for the TV to re-broadcast after each press
-    _VOLUME_STALL_LIMIT = 6      # give up after this many presses with no change
+    # --- volume stepping (used when audio is routed over ARC/eARC) -------------
+    # The TV has no absolute-volume command for an external amp: it relays CEC
+    # key presses, and CEC volume control is step-based only. So an absolute
+    # volume_set is emulated by sending N presses.
+    #
+    # _VOLUME_STEP_SIZE = how much ONE press moves the reported volume.
+    #   0.5 -> AVRs that step in half units (2 presses per reported unit)
+    #   1.0 -> devices that step in whole units (1 press per unit)
+    # Set this to match your amp; it is the knob that decides how far you land.
+    _VOLUME_STEP_SIZE = 0.5
+    _VOLUME_STEP_DELAY = 0.08    # gap between presses; raise if presses get dropped
+    _MAX_VOLUME_STEPS = 200      # safety cap on a single volume_set
 
     # Refresh the access token when it has less than this until expiry.
     _TOKEN_REFRESH_THRESHOLD = 24 * 60 * 60  # 1 day
@@ -473,43 +482,33 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self.async_request_refresh()
             return
 
-        if current == target:
+        delta = target - int(current)
+        if delta == 0:
             return
 
-        # Closed-loop: step toward the target while WATCHING the live broadcast
-        # volume, and stop when it actually reaches the target. This self-corrects
-        # for the amp's step granularity (e.g. an AVR moving 0.5 per press, so the
-        # reported whole-number volume only changes every ~2 presses) instead of
-        # pre-computing a press count that assumes 1 unit per press.
-        going_up = target > current
-        step = self.tv.async_volume_up if going_up else self.tv.async_volume_down
-        _LOGGER.debug("Stepping volume %s -> %s (%s, closed-loop)",
-                      current, target, "up" if going_up else "down")
+        # Open loop: send a fixed number of presses. The TV's volume broadcasts lag
+        # too much to steer off them reliably, so we compute the press count up
+        # front from the amp's step size (see _VOLUME_STEP_SIZE).
+        # UI option wins; falls back to the class default.
+        try:
+            step_size = float(
+                self.entry.options.get("volume_step_size", self._VOLUME_STEP_SIZE)
+            )
+        except (TypeError, ValueError):
+            step_size = self._VOLUME_STEP_SIZE
+        if step_size <= 0:
+            step_size = 1.0
+        presses = int(round(abs(delta) / step_size))
+        presses = max(1, min(presses, self._MAX_VOLUME_STEPS))
 
-        last = current
-        stalled = 0
-        for _ in range(self._MAX_VOLUME_STEPS):
-            cur = self._live_volume
-            if cur is None:
-                break
-            if (going_up and cur >= target) or (not going_up and cur <= target):
-                break
-
+        step = self.tv.async_volume_up if delta > 0 else self.tv.async_volume_down
+        _LOGGER.debug(
+            "Stepping volume %s -> %s: %s presses %s (step size %s)",
+            current, target, presses, "up" if delta > 0 else "down", step_size,
+        )
+        for _ in range(presses):
             await step()
             await asyncio.sleep(self._VOLUME_STEP_DELAY)
-
-            # Progress guard. A 0.5-per-press amp legitimately shows no change on
-            # alternate presses, so only bail after several no-change reads in a
-            # row (i.e. genuinely stuck at a min/max limit).
-            if self._live_volume == last:
-                stalled += 1
-                if stalled >= self._VOLUME_STALL_LIMIT:
-                    _LOGGER.debug("Volume stepping stalled at %s (target %s)",
-                                  last, target)
-                    break
-            else:
-                stalled = 0
-                last = self._live_volume
 
         await self.async_request_refresh()
 
