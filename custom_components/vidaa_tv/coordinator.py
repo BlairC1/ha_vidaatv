@@ -129,7 +129,9 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.debug("Refreshed existing device %s: %s", device_entry.id, updates)
 
     # Safety cap on emulated volume stepping (see async_set_volume).
-    _MAX_VOLUME_STEPS = 60
+    _MAX_VOLUME_STEPS = 200      # safety cap (0.5-step amps need ~2 presses per unit)
+    _VOLUME_STEP_DELAY = 0.20    # wait for the TV to re-broadcast after each press
+    _VOLUME_STALL_LIMIT = 6      # give up after this many presses with no change
 
     # Refresh the access token when it has less than this until expiry.
     _TOKEN_REFRESH_THRESHOLD = 24 * 60 * 60  # 1 day
@@ -471,17 +473,43 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self.async_request_refresh()
             return
 
-        delta = target - int(current)
-        if delta == 0:
+        if current == target:
             return
 
-        step = self.tv.async_volume_up if delta > 0 else self.tv.async_volume_down
-        steps = min(abs(delta), self._MAX_VOLUME_STEPS)
-        _LOGGER.debug("Stepping volume %s -> %s (%s x %s)", current, target, steps,
-                      "up" if delta > 0 else "down")
-        for _ in range(steps):
+        # Closed-loop: step toward the target while WATCHING the live broadcast
+        # volume, and stop when it actually reaches the target. This self-corrects
+        # for the amp's step granularity (e.g. an AVR moving 0.5 per press, so the
+        # reported whole-number volume only changes every ~2 presses) instead of
+        # pre-computing a press count that assumes 1 unit per press.
+        going_up = target > current
+        step = self.tv.async_volume_up if going_up else self.tv.async_volume_down
+        _LOGGER.debug("Stepping volume %s -> %s (%s, closed-loop)",
+                      current, target, "up" if going_up else "down")
+
+        last = current
+        stalled = 0
+        for _ in range(self._MAX_VOLUME_STEPS):
+            cur = self._live_volume
+            if cur is None:
+                break
+            if (going_up and cur >= target) or (not going_up and cur <= target):
+                break
+
             await step()
-            await asyncio.sleep(0.08)   # let the TV/AVR keep up and re-broadcast
+            await asyncio.sleep(self._VOLUME_STEP_DELAY)
+
+            # Progress guard. A 0.5-per-press amp legitimately shows no change on
+            # alternate presses, so only bail after several no-change reads in a
+            # row (i.e. genuinely stuck at a min/max limit).
+            if self._live_volume == last:
+                stalled += 1
+                if stalled >= self._VOLUME_STALL_LIMIT:
+                    _LOGGER.debug("Volume stepping stalled at %s (target %s)",
+                                  last, target)
+                    break
+            else:
+                stalled = 0
+                last = self._live_volume
 
         await self.async_request_refresh()
 
