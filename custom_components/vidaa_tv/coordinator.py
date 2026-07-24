@@ -58,7 +58,6 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._available = True
         self._device_info_fetched = False
         self._auth_failures = 0
-        self._last_resync = 0.0
         # Volume/mute captured directly from MQTT broadcasts (see
         # _attach_volume_listener); pyvidaa drops the ARC/external-amp type.
         self._live_volume: int | None = None
@@ -127,11 +126,6 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if updates:
                 device_registry.async_update_device(device_entry.id, **updates)
                 _LOGGER.debug("Refreshed existing device %s: %s", device_entry.id, updates)
-
-    # After a (re)connect this TV pushes state TWICE: first a misleading
-    # fake_sleep_* frame (~4.6s), then the real state (~5.2s). Waiting only ~3s
-    # captures the first and reports the TV as off while it is on. Wait past both.
-    _CONNECT_PUSH_WAIT = 6.0
 
     # Safety cap on emulated volume stepping (see async_set_volume).
     # --- volume stepping (used when audio is routed over ARC/eARC) -------------
@@ -254,8 +248,6 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # A reconnect can mean the TV rebooted (e.g. a firmware update),
                 # so re-fetch device info to pick up a new firmware version.
                 self._device_info_fetched = False
-                self._last_resync = time.monotonic()
-                await asyncio.sleep(self._CONNECT_PUSH_WAIT)  # see _CONNECT_PUSH_WAIT
 
             self._available = True
 
@@ -271,23 +263,13 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Cache device info on first successful connection
             await self._async_fetch_device_info()
 
-            # --- Timed resync: catch state changes missed while connected --------
-            # (e.g. the one-shot broadcast the TV sends at power-on). The TV won't
-            # answer gettvstate, but it re-pushes current state ~3s after a connect,
-            # so periodically reconnect and wait for that push. Throttled by
-            # RESYNC_SECONDS; the stable MAC keeps each reconnect clean.
-            RESYNC_SECONDS = 30  # tune: lower = snappier power-on detection, more reconnects
-            now_mono = time.monotonic()
-            if self.tv.is_connected and (now_mono - self._last_resync) >= RESYNC_SECONDS:
-                self._last_resync = now_mono
-                _LOGGER.debug("Periodic resync: reconnecting to trigger the TV state push")
-                try:
-                    await self.tv.async_reset()
-                    if await self.tv.async_connect(timeout=5):
-                        await asyncio.sleep(self._CONNECT_PUSH_WAIT)  # see _CONNECT_PUSH_WAIT
-                except Exception as err:  # noqa: BLE001
-                    _LOGGER.debug("Resync reconnect failed; keeping last state: %s", err)
-            # --- end timed resync ------------------------------------------------
+            # NOTE: no periodic resync here, deliberately.
+            # This TV pushes a fake_sleep_* frame on every (re)connect regardless of
+            # whether it is actually on, which OVERWRITES a good cached state and
+            # made is_on report "off" while the TV was on. Since the current source
+            # is now queried live via sourcelist (below), there is nothing left that
+            # needs a reconnect to refresh - so we keep the connection up and let the
+            # TV's change broadcasts maintain the cached state.
             
 
             
