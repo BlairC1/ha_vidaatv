@@ -63,6 +63,8 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # _attach_volume_listener); pyvidaa drops the ARC/external-amp type.
         self._live_volume: int | None = None
         self._live_muted: bool = False
+        # Which output last reported volume: 0 = TV speakers, 1 = ARC/external amp.
+        self._live_volume_type: int | None = None
         # Parsed device info (model, sw_version, name, ip, device_id) cached from
         # the TV's getdeviceinfo; entities build their DeviceInfo from this.
         self.device_data: dict[str, Any] = {}
@@ -125,6 +127,9 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if updates:
                 device_registry.async_update_device(device_entry.id, **updates)
                 _LOGGER.debug("Refreshed existing device %s: %s", device_entry.id, updates)
+
+    # Safety cap on emulated volume stepping (see async_set_volume).
+    _MAX_VOLUME_STEPS = 60
 
     # Refresh the access token when it has less than this until expiry.
     _TOKEN_REFRESH_THRESHOLD = 24 * 60 * 60  # 1 day
@@ -193,6 +198,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     vval = int(payload.get("volume_value", 0))
                     if vtype in (0, 1):
                         self._live_volume = vval
+                        self._live_volume_type = vtype
                     elif vtype == 2:
                         self._live_muted = bool(vval)
             except Exception:  # noqa: BLE001 - never break the MQTT callback
@@ -441,8 +447,42 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self.async_request_refresh()
 
     async def async_set_volume(self, volume: int) -> None:
-        """Set volume level."""
-        await self.tv.async_set_volume(volume)
+        """Set volume level.
+
+        The absolute ``changevolume`` command is ignored when audio is routed over
+        ARC/eARC to an external amp (the TV only applies it to its own speakers),
+        so step to the target with volume_up/volume_down instead. The live volume
+        captured from the broadcasts (see _attach_volume_listener) gives us the
+        current level to compute the delta from. Falls back to the absolute command
+        if we have not seen a volume broadcast yet.
+        """
+        import asyncio
+
+        target = max(0, min(100, int(volume)))
+        current = self._live_volume
+
+        # The TV applies absolute changevolume to its OWN speakers (volume_type 0),
+        # where it works fine. Only emulate with stepping when audio is routed to an
+        # external amp over ARC/eARC (volume_type 1), where absolute is ignored.
+        if self._live_volume_type != 1 or current is None:
+            _LOGGER.debug("Absolute volume set to %s (output type=%s)",
+                          target, self._live_volume_type)
+            await self.tv.async_set_volume(target)
+            await self.async_request_refresh()
+            return
+
+        delta = target - int(current)
+        if delta == 0:
+            return
+
+        step = self.tv.async_volume_up if delta > 0 else self.tv.async_volume_down
+        steps = min(abs(delta), self._MAX_VOLUME_STEPS)
+        _LOGGER.debug("Stepping volume %s -> %s (%s x %s)", current, target, steps,
+                      "up" if delta > 0 else "down")
+        for _ in range(steps):
+            await step()
+            await asyncio.sleep(0.08)   # let the TV/AVR keep up and re-broadcast
+
         await self.async_request_refresh()
 
     async def async_select_source(self, source: str) -> None:
