@@ -59,6 +59,10 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._device_info_fetched = False
         self._auth_failures = 0
         self._last_resync = 0.0
+        # Volume/mute captured directly from MQTT broadcasts (see
+        # _attach_volume_listener); pyvidaa drops the ARC/external-amp type.
+        self._live_volume: int | None = None
+        self._live_muted: bool = False
         # Parsed device info (model, sw_version, name, ip, device_id) cached from
         # the TV's getdeviceinfo; entities build their DeviceInfo from this.
         self.device_data: dict[str, Any] = {}
@@ -151,6 +155,51 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception as err:
             _LOGGER.debug("Token refresh check failed: %s", err)
 
+    def _attach_volume_listener(self) -> None:
+        """Tee the MQTT callback to capture volume broadcasts pyvidaa discards.
+
+        Verified on this firmware:
+            volume_type 0 = TV internal speaker volume
+            volume_type 1 = ARC/eARC external amp volume (AVR / soundbar)
+            volume_type 2 = mute state (0 = unmuted, 1 = muted)
+        The TV only broadcasts the type for the CURRENTLY ACTIVE output, so with
+        audio running through an AVR only type 1 is sent - which pyvidaa ignores,
+        leaving volume permanently None. Last-wins is correct because only the
+        active output broadcasts.
+
+        The flag lives on the paho client, which async_reset() replaces, so the
+        hook re-attaches automatically after every reconnect.
+        """
+        client = getattr(self.tv, "_client", None)
+        if client is None or getattr(client, "_vidaa_vol_hook", False):
+            return
+
+        import json
+
+        previous = client.on_message
+
+        def _hook(c, userdata, msg):
+            try:
+                if "volumechange" in msg.topic or "/volume" in msg.topic:
+                    payload = json.loads(msg.payload.decode("utf-8", "replace"))
+                    vtype = int(payload.get("volume_type", 0))
+                    vval = int(payload.get("volume_value", 0))
+                    if vtype in (0, 1):
+                        self._live_volume = vval
+                    elif vtype == 2:
+                        self._live_muted = bool(vval)
+            except Exception:  # noqa: BLE001 - never break the MQTT callback
+                pass
+            if previous:
+                try:
+                    previous(c, userdata, msg)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        client.on_message = _hook
+        client._vidaa_vol_hook = True
+        _LOGGER.debug("Volume broadcast listener attached")
+
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from TV."""
         import asyncio, time
@@ -181,6 +230,9 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             self._available = True
 
+            # Capture volume broadcasts pyvidaa ignores (re-attaches after reconnects).
+            self._attach_volume_listener()
+
             # Renew the access token before it lapses while connected.
             await self._async_maybe_refresh_token()
 
@@ -192,7 +244,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # answer gettvstate, but it re-pushes current state ~3s after a connect,
             # so periodically reconnect and wait for that push. Throttled by
             # RESYNC_SECONDS; the stable MAC keeps each reconnect clean.
-            RESYNC_SECONDS = 60  # tune: lower = snappier power-on detection, more reconnects
+            RESYNC_SECONDS = 30  # tune: lower = snappier power-on detection, more reconnects
             now_mono = time.monotonic()
             if self.tv.is_connected and (now_mono - self._last_resync) >= RESYNC_SECONDS:
                 self._last_resync = now_mono
@@ -211,34 +263,40 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             state_start = time.monotonic()
             state = await self.tv.async_get_state(timeout=0.5)
             _LOGGER.debug("get_state took %.2fs, raw state: %s", time.monotonic() - state_start, state)
+            # NOTE: this firmware never answers gettvstate; the call returns the
+            # cached broadcast/connect-push value, so a long timeout only wastes time.
 
-            # --- live source query (sourcelist answers; gettvstate does not) ---
-            # The selected input is the entry with is_signal == "1". This is a real
-            # on-demand query, so the source stays correct even if a broadcast was
-            # missed (e.g. the one-shot the TV sends at power-on).
+            # --- live source query (sourcelist answers; gettvstate does not) ----
+            # Verified: get_sources() replies in ~0.5s on
+            #   /remoteapp/mobile/<client>/ui_service/data/sourcelist
+            # and marks the SELECTED input with is_signal == "1" (the flag follows
+            # the selection even to an input with nothing plugged in). This is a
+            # real on-demand query, so the source stays correct even when the
+            # one-shot broadcast the TV sends at power-on is missed.
             active_source = None
-            sources_answered = False
             try:
                 src_start = time.monotonic()
                 sources = await self.tv.async_get_sources(timeout=6)
                 if sources:
-                    sources_answered = True
-                    for s in sources:
-                        if str(s.get("is_signal")) == "1":
-                            active_source = s.get("displayname") or s.get("sourcename")
+                    for s_ in sources:
+                        if str(s_.get("is_signal")) == "1":
+                            active_source = s_.get("displayname") or s_.get("sourcename")
                             break
-                _LOGGER.debug(
-                    "get_sources took %.2fs, active source: %s",
-                    time.monotonic() - src_start, active_source,
-                )
+                _LOGGER.debug("get_sources took %.2fs, active source: %s",
+                              time.monotonic() - src_start, active_source)
             except Exception as err:  # noqa: BLE001
                 _LOGGER.debug("get_sources failed: %s", err)
-            # --- end live source query -----------------------------------------
-            
+            # --- end live source query ------------------------------------------
+
             # Determine power state
             is_on = True
             if state:
-                if state.get("statetype") == STATE_FAKE_SLEEP:
+                # This firmware reports fake_sleep_0 AND fake_sleep_1 when off;
+                # STATE_FAKE_SLEEP only matches the former. Prefix-match both.
+                # NOTE: panel-off "audio only" mode also reports fake_sleep_1, so
+                # it reads as off. Revert to an == comparison if you need that
+                # mode to report as on.
+                if str(state.get("statetype", "")).startswith("fake_sleep"):
                     is_on = False
             else:
                 # No state response - TV might be off or unreachable
@@ -253,12 +311,19 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 try:
                     vol_start = time.monotonic()
                     # Short timeout since TV may not respond to direct volume query
-                    volume = await self.tv.async_get_volume(timeout=1)
+                    volume = await self.tv.async_get_volume(timeout=0.2)
                     is_muted = self.tv.is_muted
                     _LOGGER.debug("get_volume took %.2fs, volume=%s, muted=%s",
                                  time.monotonic() - vol_start, volume, is_muted)
                 except Exception as err:
                     _LOGGER.debug("get_volume failed: %s", err)
+
+                # Broadcast-derived values win: getvolume is never answered on this
+                # firmware, and pyvidaa discards the ARC (type 1) broadcasts.
+                if self._live_volume is not None:
+                    volume = self._live_volume
+                if self._live_muted:
+                    is_muted = True
 
             # Build data dict
             # State contains 'statetype' which indicates current activity:
@@ -282,6 +347,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         app = state.get("name", "").capitalize()
                 elif statetype == "sourceswitch":
                     source = state.get("displayname") or state.get("sourcename")
+
             # The live sourcelist query wins over the (possibly stale) broadcast.
             if active_source:
                 source = active_source
