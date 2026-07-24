@@ -312,13 +312,18 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Determine power state
             is_on = True
             if state:
-                # Verified by probing one TV in both states (see README):
+                # Verified by probing a TV in both states:
                 #   fake_sleep_0 = off / standby
-                #   fake_sleep_1 = AWAKE with the panel possibly off (maintenance
-                #                  wake, audio-only mode, or just-connected)
+                #   fake_sleep_1 = AWAKE but panel off (nightly maintenance wake,
+                #                  audio-only mode, or simply just-connected)
                 #   sourceswitch / livetv / app / remote_launcher = on and in use
-                # So ONLY fake_sleep_0 means off. Do not prefix-match "fake_sleep":
-                # that reports an awake TV as off.
+                #
+                # OBSERVATION MODE: only fake_sleep_0 counts as off for now, so
+                # behaviour is unchanged while we gather 2am data. If the overnight
+                # log shows the maintenance wake (fake_sleep_1) with
+                # volume_answered=False, switch this to a startswith("fake_sleep")
+                # test and the volume probe below will still rescue a genuinely-on
+                # TV that is momentarily reporting fake_sleep_1.
                 if state.get("statetype") == STATE_FAKE_SLEEP:
                     is_on = False
             else:
@@ -397,8 +402,11 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "source": source,
             }
 
-            _LOGGER.debug("State data: is_on=%s, statetype=%s, volume=%s, app=%s, source=%s",
-                         is_on, statetype, volume, app, source)
+            _LOGGER.debug(
+                "State data: is_on=%s, statetype=%s, volume=%s, app=%s, source=%s, "
+                "volume_answered=%s",
+                is_on, statetype, volume, app, source, volume_answered,
+            )
             _LOGGER.debug("Total update took %.2fs", time.monotonic() - start)
             return data
 
