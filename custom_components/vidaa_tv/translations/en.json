@@ -57,11 +57,13 @@
         "description": "Configure options for your Vidaa TV.",
         "data": {
           "scan_interval": "Polling interval",
-          "wol_mac": "Wake-on-LAN MAC address"
+          "wol_mac": "Wake-on-LAN MAC address",
+          "volume_step_size": "Volume step size"
         },
         "data_description": {
           "scan_interval": "How often to poll the TV for state updates (in seconds).",
-          "wol_mac": "MAC address to use for Wake-on-LAN. Leave empty to use the default."
+          "wol_mac": "MAC address to use for Wake-on-LAN. Leave empty to use the default.",
+          "volume_step_size": "How much one volume up/down press changes the volume. Used to set an absolute volume when audio is routed to an amp over ARC/eARC, where the TV only supports step-based control. Use 0.5 for AVRs that step in half units, 1.0 for whole units."
         }
       }
     }
