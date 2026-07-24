@@ -19,6 +19,9 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.selector import (
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
@@ -630,6 +633,13 @@ class VidaaTVOptionsFlow(config_entries.OptionsFlow):
         current_wol_mac = self.config_entry.options.get(
             "wol_mac", self.config_entry.data.get(CONF_DEVICE_ID, "")
         )
+        # How much one volume_up/down press moves the volume. Used to emulate an
+        # absolute volume_set over ARC/eARC, where the TV has no absolute command
+        # (it relays step-based CEC key presses). 0.5 suits AVRs that step in half
+        # units; 1.0 suits devices that step in whole units.
+        current_volume_step = str(
+            self.config_entry.options.get("volume_step_size", 0.5)
+        )
 
         return self.async_show_form(
             step_id="init",
@@ -652,6 +662,15 @@ class VidaaTVOptionsFlow(config_entries.OptionsFlow):
                         default=current_wol_mac,
                     ): TextSelector(
                         TextSelectorConfig(type=TextSelectorType.TEXT)
+                    ),
+                    vol.Optional(
+                        "volume_step_size",
+                        default=current_volume_step,
+                    ): SelectSelector(
+                        SelectSelectorConfig(
+                            options=["0.5", "1.0"],
+                            mode=SelectSelectorMode.DROPDOWN,
+                        )
                     ),
                 }
             ),
