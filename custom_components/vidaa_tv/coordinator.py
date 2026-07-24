@@ -128,6 +128,11 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 device_registry.async_update_device(device_entry.id, **updates)
                 _LOGGER.debug("Refreshed existing device %s: %s", device_entry.id, updates)
 
+    # After a (re)connect this TV pushes state TWICE: first a misleading
+    # fake_sleep_* frame (~4.6s), then the real state (~5.2s). Waiting only ~3s
+    # captures the first and reports the TV as off while it is on. Wait past both.
+    _CONNECT_PUSH_WAIT = 6.0
+
     # Safety cap on emulated volume stepping (see async_set_volume).
     # --- volume stepping (used when audio is routed over ARC/eARC) -------------
     # The TV has no absolute-volume command for an external amp: it relays CEC
@@ -250,7 +255,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # so re-fetch device info to pick up a new firmware version.
                 self._device_info_fetched = False
                 self._last_resync = time.monotonic()
-                await asyncio.sleep(3)  # wait for the TV's connect-push before reading state
+                await asyncio.sleep(self._CONNECT_PUSH_WAIT)  # see _CONNECT_PUSH_WAIT
 
             self._available = True
 
@@ -279,7 +284,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 try:
                     await self.tv.async_reset()
                     if await self.tv.async_connect(timeout=5):
-                        await asyncio.sleep(3)  # let the connect-push refresh cached state
+                        await asyncio.sleep(self._CONNECT_PUSH_WAIT)  # see _CONNECT_PUSH_WAIT
                 except Exception as err:  # noqa: BLE001
                     _LOGGER.debug("Resync reconnect failed; keeping last state: %s", err)
             # --- end timed resync ------------------------------------------------
