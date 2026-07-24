@@ -192,7 +192,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # answer gettvstate, but it re-pushes current state ~3s after a connect,
             # so periodically reconnect and wait for that push. Throttled by
             # RESYNC_SECONDS; the stable MAC keeps each reconnect clean.
-            RESYNC_SECONDS = 90  # tune: lower = snappier power-on detection, more reconnects
+            RESYNC_SECONDS = 60  # tune: lower = snappier power-on detection, more reconnects
             now_mono = time.monotonic()
             if self.tv.is_connected and (now_mono - self._last_resync) >= RESYNC_SECONDS:
                 self._last_resync = now_mono
@@ -212,6 +212,29 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             state = await self.tv.async_get_state(timeout=3)
             _LOGGER.debug("get_state took %.2fs, raw state: %s", time.monotonic() - state_start, state)
 
+            # --- live source query (sourcelist answers; gettvstate does not) ---
+            # The selected input is the entry with is_signal == "1". This is a real
+            # on-demand query, so the source stays correct even if a broadcast was
+            # missed (e.g. the one-shot the TV sends at power-on).
+            active_source = None
+            sources_answered = False
+            try:
+                src_start = time.monotonic()
+                sources = await self.tv.async_get_sources(timeout=6)
+                if sources:
+                    sources_answered = True
+                    for s in sources:
+                        if str(s.get("is_signal")) == "1":
+                            active_source = s.get("displayname") or s.get("sourcename")
+                            break
+                _LOGGER.debug(
+                    "get_sources took %.2fs, active source: %s",
+                    time.monotonic() - src_start, active_source,
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("get_sources failed: %s", err)
+            # --- end live source query -----------------------------------------
+            
             # Determine power state
             is_on = True
             if state:
@@ -259,6 +282,9 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         app = state.get("name", "").capitalize()
                 elif statetype == "sourceswitch":
                     source = state.get("displayname") or state.get("sourcename")
+            # The live sourcelist query wins over the (possibly stale) broadcast.
+            if active_source:
+                source = active_source
 
             data = {
                 "is_on": is_on,
