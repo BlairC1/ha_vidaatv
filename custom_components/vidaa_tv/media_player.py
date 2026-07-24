@@ -192,8 +192,18 @@ class VidaaTVMediaPlayer(CoordinatorEntity[VidaaTVDataUpdateCoordinator], MediaP
                 self._source_list = []
                 for s in sources:
                     if isinstance(s, dict):
-                        name = s.get("sourcename", s.get("name", f"Source {s.get('sourceid', '?')}"))
-                        self._source_list.append(name)
+                        # Use displayname (e.g. "Onkyo AVR") to match what the
+                        # coordinator reports as the current source. Home Assistant
+                        # only shows the active source if it is a member of
+                        # source_list, so the two must use the same naming.
+                        name = (
+                            s.get("displayname")
+                            or s.get("sourcename")
+                            or s.get("name")
+                            or f"Source {s.get('sourceid', '?')}"
+                        )
+                        if name not in self._source_list:
+                            self._source_list.append(name)
 
             apps = await self.coordinator.async_get_apps()
             if apps and isinstance(apps, list):
@@ -242,7 +252,16 @@ class VidaaTVMediaPlayer(CoordinatorEntity[VidaaTVDataUpdateCoordinator], MediaP
                 await self.coordinator.async_launch_app(source)
                 return
 
-        # Otherwise treat as input source
+        # Otherwise treat as input source. source_list holds display names
+        # (e.g. "Onkyo AVR"), so map back to the TV's source id before sending.
+        for s in self._sources:
+            if not isinstance(s, dict):
+                continue
+            if source in (s.get("displayname"), s.get("sourcename"), s.get("name")):
+                target = s.get("sourceid") or s.get("sourcename") or source
+                await self.coordinator.async_select_source(target)
+                return
+
         await self.coordinator.async_select_source(source)
 
     async def async_media_play(self) -> None:
