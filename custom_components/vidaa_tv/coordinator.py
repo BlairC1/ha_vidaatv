@@ -209,7 +209,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             
             # Get current state
             state_start = time.monotonic()
-            state = await self.tv.async_get_state(timeout=3)
+            state = await self.tv.async_get_state(timeout=0.5)
             _LOGGER.debug("get_state took %.2fs, raw state: %s", time.monotonic() - state_start, state)
 
             # --- live source query (sourcelist answers; gettvstate does not) ---
