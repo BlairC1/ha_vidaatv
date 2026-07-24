@@ -170,8 +170,15 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         The flag lives on the paho client, which async_reset() replaces, so the
         hook re-attaches automatically after every reconnect.
         """
-        client = getattr(self.tv, "_client", None)
-        if client is None or getattr(client, "_vidaa_vol_hook", False):
+        # self.tv is an AsyncVidaaTV, which lazily wraps a sync VidaaTV; the paho
+        # client lives one level deeper again. Either level can be None before the
+        # first connect, so walk down and bail out safely if it is not ready yet.
+        client = getattr(self.tv, "_client", None)          # AsyncVidaaTV -> VidaaTV
+        if client is not None and not hasattr(client, "on_message"):
+            client = getattr(client, "_client", None)       # VidaaTV -> paho client
+        if client is None or not hasattr(client, "on_message"):
+            return
+        if getattr(client, "_vidaa_vol_hook", False):
             return
 
         import json
@@ -231,7 +238,10 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._available = True
 
             # Capture volume broadcasts pyvidaa ignores (re-attaches after reconnects).
-            self._attach_volume_listener()
+            try:
+                self._attach_volume_listener()
+            except Exception as err:  # noqa: BLE001 - must never fail the refresh
+                _LOGGER.debug("Could not attach volume listener: %s", err)
 
             # Renew the access token before it lapses while connected.
             await self._async_maybe_refresh_token()
