@@ -64,6 +64,11 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._live_muted: bool = False
         # Which output last reported volume: 0 = TV speakers, 1 = ARC/external amp.
         self._live_volume_type: int | None = None
+        # When a volume broadcast last arrived. Publishing getvolume makes a TV
+        # that is ON emit one; a TV in standby stays silent. That gives us a LIVE
+        # power probe, which the cached statetype cannot provide (the connect-push
+        # reports fake_sleep_* regardless of whether the TV is on).
+        self._live_volume_ts: float = 0.0
         # Parsed device info (model, sw_version, name, ip, device_id) cached from
         # the TV's getdeviceinfo; entities build their DeviceInfo from this.
         self.device_data: dict[str, Any] = {}
@@ -206,6 +211,8 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     payload = json.loads(msg.payload.decode("utf-8", "replace"))
                     vtype = int(payload.get("volume_type", 0))
                     vval = int(payload.get("volume_value", 0))
+                    import time as _t
+                    self._live_volume_ts = _t.monotonic()
                     if vtype in (0, 1):
                         self._live_volume = vval
                         self._live_volume_type = vtype
@@ -305,12 +312,14 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Determine power state
             is_on = True
             if state:
-                # This firmware reports fake_sleep_0 AND fake_sleep_1 when off;
-                # STATE_FAKE_SLEEP only matches the former. Prefix-match both.
-                # NOTE: panel-off "audio only" mode also reports fake_sleep_1, so
-                # it reads as off. Revert to an == comparison if you need that
-                # mode to report as on.
-                if str(state.get("statetype", "")).startswith("fake_sleep"):
+                # Verified by probing one TV in both states (see README):
+                #   fake_sleep_0 = off / standby
+                #   fake_sleep_1 = AWAKE with the panel possibly off (maintenance
+                #                  wake, audio-only mode, or just-connected)
+                #   sourceswitch / livetv / app / remote_launcher = on and in use
+                # So ONLY fake_sleep_0 means off. Do not prefix-match "fake_sleep":
+                # that reports an awake TV as off.
+                if state.get("statetype") == STATE_FAKE_SLEEP:
                     is_on = False
             else:
                 # No state response - TV might be off or unreachable
@@ -321,23 +330,35 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # from volumechange broadcasts when user changes volume
             volume = None
             is_muted = False
-            if is_on:
-                try:
-                    vol_start = time.monotonic()
-                    # Short timeout since TV may not respond to direct volume query
-                    volume = await self.tv.async_get_volume(timeout=0.2)
-                    is_muted = self.tv.is_muted
-                    _LOGGER.debug("get_volume took %.2fs, volume=%s, muted=%s",
-                                 time.monotonic() - vol_start, volume, is_muted)
-                except Exception as err:
-                    _LOGGER.debug("get_volume failed: %s", err)
 
-                # Broadcast-derived values win: getvolume is never answered on this
-                # firmware, and pyvidaa discards the ARC (type 1) broadcasts.
-                if self._live_volume is not None:
-                    volume = self._live_volume
-                if self._live_muted:
-                    is_muted = True
+            # Probe volume unconditionally: publishing getvolume makes an ON TV
+            # broadcast its volume, so a fresh broadcast is a live "TV is on"
+            # signal. (Do not gate this on is_on - that is what we are testing.)
+            probe_before = self._live_volume_ts
+            try:
+                vol_start = time.monotonic()
+                await self.tv.async_get_volume(timeout=1.0)
+                is_muted = self.tv.is_muted
+                _LOGGER.debug("get_volume probe took %.2fs", time.monotonic() - vol_start)
+            except Exception as err:
+                _LOGGER.debug("get_volume failed: %s", err)
+
+            volume_answered = self._live_volume_ts > probe_before
+            if volume_answered:
+                # A TV in standby does not emit volume broadcasts, so this is a
+                # positive power signal. Additive only: it can promote to on, never
+                # demote, so a wrong guess here cannot make the state worse.
+                if not is_on:
+                    _LOGGER.debug(
+                        "Volume broadcast received; treating TV as on "
+                        "(cached statetype was %s)", state.get("statetype") if state else None,
+                    )
+                is_on = True
+
+            if self._live_volume is not None:
+                volume = self._live_volume
+            if self._live_muted:
+                is_muted = True
 
             # Build data dict
             # State contains 'statetype' which indicates current activity:
