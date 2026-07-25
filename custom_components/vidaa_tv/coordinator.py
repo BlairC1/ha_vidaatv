@@ -85,7 +85,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._volume_task = None              # in-flight ARC volume stepping task
         self._volume_target: int | None = None
         # ARC volume instrumentation (see VOLDBG lines in the debug log)
-        self._vol_debug = True
+        self._vol_debug = False
         self._press_count = 0
         self._last_press_ts: float = 0.0
         self._source_cache: list[dict] = []  # full sourcelist from last good poll
@@ -223,7 +223,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # rate the amp actually manages (~0.75s/step measured). These only bound the
     # failure cases.
     # Reachability probe: a dead host fails in ms, so this is near-free.
-    _PROBE_TIMEOUT = 1.5
+    _PROBE_TIMEOUT = 0.5
 
     _VOLUME_ACK_TIMEOUT = 2.0    # how long to wait for a press to be acknowledged
     _VOLUME_STALL_LIMIT = 3      # consecutive unacknowledged presses before giving up
