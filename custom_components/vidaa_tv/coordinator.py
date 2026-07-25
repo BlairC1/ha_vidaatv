@@ -171,13 +171,13 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # key presses, and CEC volume control is step-based only. So an absolute
     # volume_set is emulated by sending N presses.
     #
-    # _VOLUME_STEP_SIZE = how much ONE press moves the reported volume.
-    #   0.5 -> AVRs that step in half units (2 presses per reported unit)
-    #   1.0 -> devices that step in whole units (1 press per unit)
-    # Set this to match your amp; it is the knob that decides how far you land.
-    _VOLUME_STEP_SIZE = 0.5
-    _VOLUME_STEP_DELAY = 0.08    # gap between presses; raise if presses get dropped
-    _MAX_VOLUME_STEPS = 200      # safety cap on a single volume_set
+    # Each press waits for the TV to acknowledge it with a volume broadcast, so
+    # there is no fixed inter-press delay to tune - the loop runs at whatever
+    # rate the amp actually manages (~0.75s/step measured). These only bound the
+    # failure cases.
+    _VOLUME_ACK_TIMEOUT = 2.0    # how long to wait for a press to be acknowledged
+    _VOLUME_STALL_LIMIT = 3      # consecutive unacknowledged presses before giving up
+    _MAX_VOLUME_STEPS = 60       # hard cap on a single volume_set
 
     # Refresh the access token when it has less than this until expiry.
     _TOKEN_REFRESH_THRESHOLD = 24 * 60 * 60  # 1 day
@@ -637,70 +637,89 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._volume_task = self.hass.async_create_task(self._async_step_volume_arc())
 
     async def _async_step_volume_arc(self) -> None:
-        """Step ARC volume toward self._volume_target, re-reading it each pass so a
-        slider drag converges on the final value instead of overshooting."""
-        try:
-            step_size = float(
-                self.entry.options.get("volume_step_size", self._VOLUME_STEP_SIZE)
-            )
-        except (TypeError, ValueError):
-            step_size = self._VOLUME_STEP_SIZE
-        if step_size <= 0:
-            step_size = 1.0
+        """Step ARC volume to self._volume_target, one confirmed press at a time.
 
+        Why this is deliberately slow: the TV relays each volume key over CEC and
+        processes them at its own pace - measured at roughly ONE press every
+        0.74s on a 65E86GEVS + Onkyo. Firing presses faster simply queues them,
+        and the queue keeps draining long after we stop. A previous version sent
+        91 presses in 7.4s to make a 10-step change; the backlog carried the
+        volume from 50 past the target of 60 all the way to 100.
+
+        So we never have more than one press in flight: press, wait for the TV to
+        broadcast the new level (that broadcast IS the acknowledgement), then
+        re-evaluate. This self-calibrates to whatever rate the amp runs at and
+        cannot overshoot, at the cost of taking ~0.75s per step.
+
+        For instant, exact volume, control the amplifier's own entity directly -
+        an AVR accepts absolute levels natively, which CEC cannot express.
+        """
         started = time.monotonic()
         start_volume = self._live_volume
         self._press_count = 0
         _LOGGER.debug(
-            "VOLDBG start: live=%s target=%s step_size=%s delay=%ss",
-            start_volume, self._volume_target, step_size, self._VOLUME_STEP_DELAY,
+            "VOLDBG start: live=%s target=%s (one confirmed press at a time)",
+            start_volume, self._volume_target,
         )
 
-        guard = 0
-        while guard < self._MAX_VOLUME_STEPS:
-            guard += 1
+        # Give up on a press that is never acknowledged, so a missed broadcast
+        # cannot wedge the loop forever.
+        ack_timeout = self._VOLUME_ACK_TIMEOUT
+        stalled = 0
+
+        while self._press_count < self._MAX_VOLUME_STEPS:
             target = self._volume_target
             current = self._live_volume
             if target is None or current is None:
                 _LOGGER.debug("VOLDBG abort: target=%s live=%s", target, current)
                 break
+
             delta = target - int(current)
-            if abs(delta) < step_size:
+            if delta == 0:
                 _LOGGER.debug(
-                    "VOLDBG stop: live=%s target=%s delta=%s < step_size=%s "
-                    "after %s presses in %.2fs",
-                    current, target, delta, step_size, self._press_count,
-                    time.monotonic() - started,
+                    "VOLDBG reached target %s after %s presses in %.2fs",
+                    target, self._press_count, time.monotonic() - started,
                 )
                 break
-            direction = "up" if delta > 0 else "down"
+
             step = self.tv.async_volume_up if delta > 0 else self.tv.async_volume_down
             self._press_count += 1
             self._last_press_ts = time.monotonic()
+            before = current
             _LOGGER.debug(
-                "VOLDBG press #%s %s: live=%s target=%s delta=%s "
-                "(age of live reading: %.0f ms)",
-                self._press_count, direction, current, target, delta,
-                (self._last_press_ts - self._live_volume_ts) * 1000
-                if self._live_volume_ts else -1,
+                "VOLDBG press #%s %s: live=%s target=%s delta=%s",
+                self._press_count, "up" if delta > 0 else "down",
+                before, target, delta,
             )
             await step()
-            await asyncio.sleep(self._VOLUME_STEP_DELAY)
+
+            # Wait for the acknowledging broadcast rather than sleeping blindly.
+            deadline = time.monotonic() + ack_timeout
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+                if self._live_volume != before:
+                    break
+
+            if self._live_volume == before:
+                stalled += 1
+                _LOGGER.debug(
+                    "VOLDBG no ack within %.1fs (stall %s/%s), live still %s",
+                    ack_timeout, stalled, self._VOLUME_STALL_LIMIT, before,
+                )
+                if stalled >= self._VOLUME_STALL_LIMIT:
+                    _LOGGER.debug(
+                        "VOLDBG giving up: volume not responding (at min/max?)"
+                    )
+                    break
+            else:
+                stalled = 0
         else:
             _LOGGER.debug("VOLDBG hit MAX_VOLUME_STEPS guard (%s)",
                           self._MAX_VOLUME_STEPS)
 
-        # Let the last broadcasts land, then report where we actually ended up.
-        await asyncio.sleep(1.0)
-        overshoot = (
-            (self._live_volume - self._volume_target)
-            if self._live_volume is not None and self._volume_target is not None
-            else None
-        )
         _LOGGER.debug(
-            "VOLDBG end: start=%s target=%s final=%s overshoot=%s presses=%s "
-            "elapsed=%.2fs",
-            start_volume, self._volume_target, self._live_volume, overshoot,
+            "VOLDBG end: start=%s target=%s final=%s presses=%s elapsed=%.2fs",
+            start_volume, self._volume_target, self._live_volume,
             self._press_count, time.monotonic() - started,
         )
         await self.async_request_refresh()
