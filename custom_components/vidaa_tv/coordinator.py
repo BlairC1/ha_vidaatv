@@ -333,8 +333,15 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # the selection even to an input with nothing plugged in). This is a
             # real on-demand query, so the source stays correct even when the
             # one-shot broadcast the TV sends at power-on is missed.
-            # Run the real queries CONCURRENTLY. They are independent, so the
-            # poll costs the slowest one (~0.5s) instead of their sum.
+            # Queries MUST run sequentially. pyvidaa serialises every request
+            # through a single shared slot:
+            #     self._response_event.clear(); self._last_response = None
+            #     ...publish...; self._response_event.wait(timeout)
+            # so two concurrent requests clobber each other - the second clears
+            # the event the first is waiting on, and whichever reply arrives
+            # first satisfies both. Running these under asyncio.gather made
+            # sourcelist return in ~0.01s with no data. Do not parallelise.
+            #
             #   sourcelist -> current input (is_signal == "1")
             #   gettvinfo  -> authoritative power state (fake_sleep_state)
             #   applist    -> installed apps; near-static, so only refreshed
@@ -345,17 +352,24 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 or self._poll_count % self._APP_REFRESH_EVERY == 0
             )
             query_start = time.monotonic()
-            tasks = [
-                self.tv.async_get_sources(timeout=6),
-                self.tv.async_get_tv_info(timeout=5),
-            ]
-            if want_apps:
-                tasks.append(self.tv.async_get_apps())
-            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            sources_res = results[0]
-            tv_info_res = results[1]
-            apps_res = results[2] if want_apps else None
+            async def _try(coro):
+                """Await a query, returning the exception rather than raising."""
+                try:
+                    return await coro
+                except Exception as err:  # noqa: BLE001
+                    return err
+
+            sources_res = await _try(self.tv.async_get_sources(timeout=6))
+            tv_info_res = await _try(self.tv.async_get_tv_info(timeout=5))
+            apps_res = await _try(self.tv.async_get_apps()) if want_apps else None
+
+            # getvolume never RETURNS a value on this firmware, but publishing it
+            # makes the TV broadcast its current volume, which the MQTT hook
+            # captures. That broadcast is the only way volume stays current while
+            # nobody is touching the remote - removing this call left volume at
+            # None. Keep the timeout short: we want the side effect, not a reply.
+            await _try(self.tv.async_get_volume(timeout=0.2))
 
             # --- current input, from sourcelist ---------------------------------
             # Verified: sourcelist replies in ~0.5s on
