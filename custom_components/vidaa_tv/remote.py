@@ -63,6 +63,7 @@ class VidaaTVRemote(CoordinatorEntity[VidaaTVDataUpdateCoordinator], RemoteEntit
         self._device_id = entry.data.get(CONF_DEVICE_ID)
         self._attr_unique_id = f"{self._device_id}_remote" if self._device_id else f"{entry.entry_id}_remote"
         self._apps: list[dict] = []
+        self._sources: list[dict] = []
         self._activity_list: list[str] = []
 
     async def async_added_to_hass(self) -> None:
@@ -76,19 +77,50 @@ class VidaaTVRemote(CoordinatorEntity[VidaaTVDataUpdateCoordinator], RemoteEntit
         if (
             self.coordinator.data
             and self.coordinator.data.get("is_on")
-            and not self._activity_list
+            and (not self._sources or not self._apps)
         ):
             self.hass.async_create_task(self._async_update_activities())
         super()._handle_coordinator_update()
 
     async def _async_update_activities(self) -> None:
-        """Update activity list from TV."""
+        """Update activity list from TV.
+
+        Activities are the launchable apps PLUS the physical input sources, so an
+        HDMI input can be selected from the remote as well as the media player.
+        Sources are listed by displayname ("Onkyo AVR") to match what the
+        coordinator reports as the current activity.
+        """
         try:
+            # Sources and apps come from two independent queries, either of which
+            # can transiently fail. Update each category only when its fetch
+            # succeeds, then rebuild the combined list from BOTH retained lists -
+            # so an empty fetch of one never drops the other.
+            sources = await self.coordinator.async_get_sources()
+            if sources and isinstance(sources, list):
+                self._sources = sources
+
             apps = await self.coordinator.async_get_apps()
-            if apps:
+            if apps and isinstance(apps, list):
                 self._apps = apps
-                self._activity_list = [app.get("name") for app in apps if app.get("name")]
-                _LOGGER.debug("Updated activity list with %d apps", len(self._activity_list))
+
+            activities: list[str] = []
+            for src in self._sources:
+                if isinstance(src, dict):
+                    name = src.get("displayname") or src.get("sourcename")
+                    if name and name not in activities:
+                        activities.append(name)
+            for app in self._apps:
+                if isinstance(app, dict):
+                    name = app.get("name")
+                    if name and name not in activities:
+                        activities.append(name)
+
+            if activities:
+                self._activity_list = activities
+                _LOGGER.debug(
+                    "Updated activity list: %d inputs + %d apps = %d entries",
+                    len(self._sources), len(self._apps), len(activities),
+                )
         except Exception as err:
             _LOGGER.debug("Error updating activities: %s", err)
 
@@ -152,11 +184,20 @@ class VidaaTVRemote(CoordinatorEntity[VidaaTVDataUpdateCoordinator], RemoteEntit
 
     @property
     def activity_list(self) -> list[str] | None:
-        """Return list of activities (Home plus launchable apps)."""
-        if not self._activity_list:
-            # Still offer Home even before the app list has been fetched.
-            return [ACTIVITY_HOME]
-        return [ACTIVITY_HOME, *self._activity_list]
+        """Home + inputs + apps, derived from coordinator data (no local fetch)."""
+        data = self.coordinator.data or {}
+        activities: list[str] = []
+        for src in data.get("sources") or []:
+            if isinstance(src, dict):
+                name = src.get("displayname") or src.get("sourcename")
+                if name and name not in activities:
+                    activities.append(name)
+        for app in data.get("apps") or []:
+            if isinstance(app, dict):
+                name = app.get("name")
+                if name and name not in activities:
+                    activities.append(name)
+        return [ACTIVITY_HOME, *activities]
 
     async def async_turn_on(self, activity: str | None = None, **kwargs: Any) -> None:
         """Turn the TV on and optionally start an activity."""
@@ -165,7 +206,16 @@ class VidaaTVRemote(CoordinatorEntity[VidaaTVDataUpdateCoordinator], RemoteEntit
             # "Home" is the launcher, not an app - navigate there via the key.
             await self.coordinator.async_send_key(get_key("home"))
         elif activity:
-            # Launch the app/activity
+            # An activity may be an input source or an app. Check sources first and
+            # switch input using the TV's own source id; otherwise launch the app.
+            known = (self.coordinator.data or {}).get("sources") or self._sources
+            for src in known:
+                if not isinstance(src, dict):
+                    continue
+                if activity in (src.get("displayname"), src.get("sourcename")):
+                    target = src.get("sourceid") or src.get("sourcename") or activity
+                    await self.coordinator.async_select_source(target)
+                    return
             await self.coordinator.async_launch_app(activity)
 
     async def async_turn_off(self, **kwargs: Any) -> None:

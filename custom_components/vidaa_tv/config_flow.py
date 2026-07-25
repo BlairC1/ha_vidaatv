@@ -331,16 +331,16 @@ class VidaaTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._discovery_info = discovery_info
         self._name = discovery_info.upnp.get("friendlyName", DEFAULT_NAME)
 
-        # Try to get unique ID from USN
-        usn = discovery_info.ssdp_usn
-        if usn:
-            # USN format: uuid:XXXX::urn:schemas-upnp-org:...
-            if "::" in usn:
-                unique_id = usn.split("::")[0].replace("uuid:", "")
-            else:
-                unique_id = usn.replace("uuid:", "")
-            await self.async_set_unique_id(unique_id)
-            self._abort_if_unique_id_configured(updates={CONF_HOST: self._host})
+        # Deduplicate against already-configured TVs by HOST first. The SSDP USN
+        # (a UPnP uuid) is NOT the same identity the manual/reconfigure flows use
+        # as the unique_id - those key on the gettvinfo `deviceid`. Setting the
+        # unique_id from the USN here would never match an existing entry, so the
+        # TV would be surfaced as "new" even though it is already added. So we
+        # abort on matching host (which every entry stores) BEFORE connecting, and
+        # only set the real unique_id once we have the device_id below.
+        for entry in self._async_current_entries():
+            if entry.data.get(CONF_HOST) == self._host:
+                return self.async_abort(reason="already_configured")
 
         # Check for certificates
         default_certfile, default_keyfile = get_default_cert_paths(self.hass)
