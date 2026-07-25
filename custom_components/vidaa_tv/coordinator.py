@@ -131,14 +131,32 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # network_type is the device id (MAC without colons) per project convention.
             "device_id": info.get("network_type"),
         }
-        # Capture the REAL hardware MAC for Wake-on-LAN. This is distinct from
-        # device_id: on some models device_id is the opaque gettvinfo `deviceid`
-        # string (not a MAC), which silently disabled WoL. eth0/wifi_mac/mac are
-        # the actual interface MACs and are what a magic packet must target.
-        self._hw_mac = (
-            info.get("eth0") or info.get("wifi_mac") or info.get("mac")
-            or self._hw_mac
-        )
+        # Capture the hardware MAC for Wake-on-LAN, choosing the interface the TV
+        # is ACTUALLY connected on. This matters: a magic packet sent to the
+        # wired MAC of a TV that is on Wi-Fi goes nowhere. getdeviceinfo reports
+        # both (`eth0`, `wlan0`) plus `network_type` telling us which is live.
+        #
+        # It is also distinct from device_id: on some models device_id is the
+        # opaque gettvinfo `deviceid` string rather than a MAC, which silently
+        # disabled WoL entirely.
+        network_type = str(info.get("network_type") or "").lower()
+        wireless = any(k in network_type for k in ("wlan", "wifi", "wireless"))
+        if wireless:
+            preferred = (
+                info.get("wlan0") or info.get("wifi_mac") or info.get("eth0")
+            )
+        else:
+            preferred = (
+                info.get("eth0") or info.get("mac") or info.get("wlan0")
+                or info.get("wifi_mac")
+            )
+        if preferred:
+            self._hw_mac = preferred
+            _LOGGER.debug(
+                "WoL target MAC %s (network_type=%r -> %s interface)",
+                preferred, info.get("network_type"),
+                "wireless" if wireless else "wired",
+            )
         self._device_info_fetched = True
         _LOGGER.debug("Cached device info: %s", self.device_data)
 
@@ -435,12 +453,15 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # Capture the REAL hardware MAC for Wake-on-LAN. Distinct from
                 # device_id, which on some models is the opaque gettvinfo
                 # `deviceid` string (not a MAC) - that silently disabled WoL.
-                self._hw_mac = (
-                    tv_info_res.get("eth0")
-                    or tv_info_res.get("wifi_mac")
-                    or tv_info_res.get("mac")
-                    or self._hw_mac
-                )
+                # Only a fallback: gettvinfo reports eth0 without saying which
+                # interface is live, so never let it override the interface-aware
+                # choice made from getdeviceinfo above.
+                if not self._hw_mac:
+                    self._hw_mac = (
+                        tv_info_res.get("eth0")
+                        or tv_info_res.get("wifi_mac")
+                        or tv_info_res.get("mac")
+                    )
                 self._tv_info = tv_info_res
                 if "fake_sleep_state" in tv_info_res:
                     is_on = str(tv_info_res.get("fake_sleep_state")) == "1"
