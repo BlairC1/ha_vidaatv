@@ -2,13 +2,16 @@
 
 Provides an "In use" signal that is stricter than the media player's on/off.
 
-Why this exists: ``gettvinfo``'s ``fake_sleep_state`` tells us whether the TV is
-awake, but the TV also wakes itself in the small hours to check for updates -
-awake, panel off, nobody watching. For automations ("is someone actually
-watching?") that nightly wake is a false positive. The activity ``statetype``
-distinguishes the two: a TV genuinely in use reports an interactive state
-(sourceswitch / livetv / app / launcher / settings / EPG), whereas the
-maintenance wake sits on ``fake_sleep_1``.
+Driven by ``is_on``, which comes from the live ``gettvinfo`` query
+(``fake_sleep_state``). That query already excludes the nightly maintenance
+wake - measured during one: the cached broadcast said ``fake_sleep_1`` while
+``fake_sleep_state`` correctly reported 0.
+
+Do NOT gate this on ``statetype``. That value is the last *cached broadcast*,
+not a live reading: after a connect it sits on ``fake_sleep_1`` until the TV
+happens to announce a change, so during ordinary viewing it reports
+``fake_sleep_1`` and the sensor read "off" while the TV was plainly in use.
+``statetype`` is still exposed as an attribute for context.
 """
 
 from __future__ import annotations
@@ -68,17 +71,16 @@ class VidaaTVInUseSensor(VidaaTVEntity, BinarySensorEntity):
 
     @property
     def is_on(self) -> bool:
-        """Return True when the TV is awake and in an interactive state."""
-        data = self.coordinator.data or {}
-        if not data.get("is_on"):
-            return False
-        return data.get("statetype") in ACTIVE_STATETYPES
+        """Return True when the TV is genuinely awake and in use."""
+        return bool((self.coordinator.data or {}).get("is_on"))
 
     @property
     def extra_state_attributes(self) -> dict[str, str | None]:
         """Expose the underlying signals so the distinction is inspectable."""
         data = self.coordinator.data or {}
         return {
+            # Cached broadcast value - context only, see the class docstring.
             "statetype": data.get("statetype"),
             "source": data.get("source"),
+            "source_detail": data.get("source_detail"),
         }
