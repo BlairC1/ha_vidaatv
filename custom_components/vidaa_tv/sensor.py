@@ -32,6 +32,9 @@ class VidaaSensorDescription(SensorEntityDescription):
     """Describes a Hisense TV sensor."""
 
     value_fn: Callable[[dict[str, Any]], Any]
+    # Optional: extra attributes, for payloads too large for a state value
+    # (Home Assistant caps sensor states at 255 characters).
+    attrs_fn: Callable[[dict[str, Any]], dict[str, Any]] | None = None
 
 
 SENSORS: tuple[VidaaSensorDescription, ...] = (
@@ -66,6 +69,25 @@ SENSORS: tuple[VidaaSensorDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
         entity_registry_enabled_default=False,
         value_fn=lambda data: data.get("statetype"),
+    ),
+    VidaaSensorDescription(
+        key="last_state_payload",
+        translation_key="last_state_payload",
+        name="Last state response",
+        icon="mdi:code-json",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+        # The state value is just the statetype (a sensor state cannot exceed
+        # 255 chars); the full decoded payloads live in the attributes.
+        value_fn=lambda data: (data.get("state") or {}).get("statetype"),
+        attrs_fn=lambda data: {
+            # Last ui_service/state frame - broadcast-driven, so this is the most
+            # recent activity change the TV announced.
+            "state": data.get("state") or {},
+            # Last platform_service/data/gettvinfo reply - the live query that
+            # drives power state (fake_sleep_state).
+            "tv_info": data.get("tv_info") or {},
+        },
     ),
     VidaaSensorDescription(
         key="chipplatform",
@@ -107,3 +129,10 @@ class VidaaTVSensor(VidaaTVEntity, SensorEntity):
     def native_value(self) -> Any:
         """Return the current value."""
         return self.entity_description.value_fn(self.coordinator.data or {})
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return the full payload for sensors that carry one."""
+        if self.entity_description.attrs_fn is None:
+            return None
+        return self.entity_description.attrs_fn(self.coordinator.data or {})

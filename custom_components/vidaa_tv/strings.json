@@ -147,37 +147,14 @@
       },
       "chipplatform": {
         "name": "Chipset"
+      },
+      "last_state_payload": {
+        "name": "Last state response"
       }
     },
     "binary_sensor": {
       "in_use": {
         "name": "In use"
-      }
-    },
-    "button": {
-      "home": {
-        "name": "Home"
-      },
-      "back": {
-        "name": "Back"
-      },
-      "menu": {
-        "name": "Menu"
-      },
-      "exit": {
-        "name": "Exit"
-      },
-      "info": {
-        "name": "Info"
-      },
-      "subtitle": {
-        "name": "Subtitles"
-      },
-      "channel_up": {
-        "name": "Channel up"
-      },
-      "channel_down": {
-        "name": "Channel down"
       }
     }
   }
