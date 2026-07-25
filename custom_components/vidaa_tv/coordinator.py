@@ -151,22 +151,34 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # opaque gettvinfo `deviceid` string rather than a MAC, which silently
         # disabled WoL entirely.
         network_type = str(info.get("network_type") or "").lower()
-        wireless = any(k in network_type for k in ("wlan", "wifi", "wireless"))
-        if wireless:
-            preferred = (
-                info.get("wlan0") or info.get("wifi_mac") or info.get("eth0")
-            )
+        bare = network_type.replace(":", "").replace("-", "")
+        network_type_is_mac = len(bare) == 12 and all(
+            c in "0123456789abcdef" for c in bare
+        )
+
+        if network_type_is_mac:
+            # Older firmware (e.g. 40A33EXVT / ...09G) puts the MAC of the
+            # ACTIVE interface directly in network_type. Trust it: it already
+            # names the live interface, and guessing from eth0/wlan0 here picks
+            # the wrong one on a TV whose wired port is unused.
+            preferred = network_type
+            how = "network_type (active interface)"
+        elif any(k in network_type for k in ("wlan", "wifi", "wireless")):
+            # Newer firmware (e.g. 65E86GEVS / ...O.P0930) reports a descriptive
+            # value instead and lists both interfaces separately.
+            preferred = info.get("wlan0") or info.get("wifi_mac") or info.get("eth0")
+            how = "wireless"
         else:
             preferred = (
                 info.get("eth0") or info.get("mac") or info.get("wlan0")
                 or info.get("wifi_mac")
             )
+            how = "wired"
         if preferred and preferred != self._hw_mac:
             self._hw_mac = preferred
             _LOGGER.debug(
-                "WoL target MAC %s (network_type=%r -> %s interface)",
-                preferred, info.get("network_type"),
-                "wireless" if wireless else "wired",
+                "WoL target MAC %s (network_type=%r -> %s)",
+                preferred, info.get("network_type"), how,
             )
             # Persist it: this is the only time we can learn it (the TV must be
             # reachable), but WoL needs it precisely when the TV is not.
