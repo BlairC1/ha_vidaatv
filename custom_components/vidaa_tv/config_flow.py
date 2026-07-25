@@ -132,8 +132,11 @@ async def validate_connection(
                 tv_info.get("deviceid")
                 or device_info.get("wifi_mac")
                 or device_info.get("mac")
-                or self._host
-                )
+                # `host` is the module-level function's parameter; this said
+                # `self._host`, which raised NameError whenever every earlier
+                # fallback was empty (validate_connection is not a method).
+                or host
+            )
             result["sw_version"] = device_info.get("tv_version")
 
         if tv_info:
