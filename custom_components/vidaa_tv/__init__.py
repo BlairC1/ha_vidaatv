@@ -7,13 +7,10 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any
 
-import voluptuous as vol
 
-from homeassistant.config_entries import ConfigEntry, ConfigEntryState
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
-from homeassistant.helpers import config_validation as cv
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceEntry
 from homeassistant.helpers.typing import ConfigType
 
@@ -28,10 +25,6 @@ from .const import (
     CONF_KEYFILE,
     DEFAULT_PORT,
     PLATFORMS,
-    SERVICE_SEND_KEY,
-    SERVICE_LAUNCH_APP,
-    ATTR_KEY,
-    ATTR_APP,
 )
 from .coordinator import VidaaTVDataUpdateCoordinator
 
@@ -123,77 +116,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: VidaaTVConfigEntry) -> b
 
 
 async def _async_setup_services(hass: HomeAssistant) -> None:
-    """Set up services for the integration."""
+    """Service setup.
 
-    async def async_send_key(call: ServiceCall) -> None:
-        """Handle send_key service call."""
-        key = call.data[ATTR_KEY]
-
-        # Get all loaded config entries for this domain
-        entries = hass.config_entries.async_entries(DOMAIN)
-        if not entries:
-            raise ServiceValidationError(
-                translation_domain=DOMAIN,
-                translation_key="no_tvs_configured",
-            )
-
-        for entry in entries:
-            if entry.state is not ConfigEntryState.LOADED:
-                continue
-            runtime_data: VidaaTVRuntimeData = entry.runtime_data
-            try:
-                await runtime_data.coordinator.async_send_key(key)
-            except Exception as err:
-                raise HomeAssistantError(
-                    translation_domain=DOMAIN,
-                    translation_key="command_failed",
-                    translation_placeholders={"error": str(err)},
-                ) from err
-
-    async def async_launch_app(call: ServiceCall) -> None:
-        """Handle launch_app service call."""
-        app = call.data[ATTR_APP]
-
-        entries = hass.config_entries.async_entries(DOMAIN)
-        if not entries:
-            raise ServiceValidationError(
-                translation_domain=DOMAIN,
-                translation_key="no_tvs_configured",
-            )
-
-        for entry in entries:
-            if entry.state is not ConfigEntryState.LOADED:
-                continue
-            runtime_data: VidaaTVRuntimeData = entry.runtime_data
-            try:
-                await runtime_data.coordinator.async_launch_app(app)
-            except Exception as err:
-                raise HomeAssistantError(
-                    translation_domain=DOMAIN,
-                    translation_key="command_failed",
-                    translation_placeholders={"error": str(err)},
-                ) from err
-
-    # Only register services once
-    if not hass.services.has_service(DOMAIN, SERVICE_SEND_KEY):
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_SEND_KEY,
-            async_send_key,
-            schema=vol.Schema({
-                vol.Required(ATTR_KEY): cv.string,
-            }),
-        )
-
-    if not hass.services.has_service(DOMAIN, SERVICE_LAUNCH_APP):
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_LAUNCH_APP,
-            async_launch_app,
-            schema=vol.Schema({
-                vol.Required(ATTR_APP): cv.string,
-            }),
-        )
+    ``send_key`` and ``launch_app`` are registered as ENTITY services by the
+    remote platform (see remote.py) so Home Assistant resolves the target
+    itself. They used to be registered here as domain services with a schema
+    that rejected `entity_id`, which made every targeted call fail validation -
+    and the handler ignored the target regardless, firing at all TVs at once.
+    """
+    return
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: VidaaTVConfigEntry) -> bool:
