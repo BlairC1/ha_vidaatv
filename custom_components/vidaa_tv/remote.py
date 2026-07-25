@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import voluptuous as vol
+
 import logging
 from typing import TYPE_CHECKING, Any, Iterable
 
 from homeassistant.components.remote import RemoteEntity, RemoteEntityFeature
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv, entity_platform
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
     ACTIVITY_HOME,
+    ATTR_APP,
+    ATTR_KEY,
+    SERVICE_LAUNCH_APP,
+    SERVICE_SEND_KEY,
     STATE_REMOTE_LAUNCHER,
 )
 from .coordinator import VidaaTVDataUpdateCoordinator
@@ -37,6 +44,23 @@ async def async_setup_entry(
     """Set up Hisense TV remote from a config entry."""
     coordinator = entry.runtime_data.coordinator
     async_add_entities([VidaaTVRemote(coordinator, entry)])
+
+    # Registered as ENTITY services so Home Assistant resolves the target for
+    # us. Previously these were plain domain services whose schema rejected
+    # `entity_id`, so every targeted call failed validation before reaching the
+    # integration - and the handler ignored the target anyway, firing at every
+    # configured TV at once.
+    platform = entity_platform.async_get_current_platform()
+    platform.async_register_entity_service(
+        SERVICE_SEND_KEY,
+        {vol.Required(ATTR_KEY): cv.string},
+        "async_send_key_service",
+    )
+    platform.async_register_entity_service(
+        SERVICE_LAUNCH_APP,
+        {vol.Required(ATTR_APP): cv.string},
+        "async_launch_app_service",
+    )
 
 
 class VidaaTVRemote(VidaaTVEntity, RemoteEntity):
@@ -112,6 +136,16 @@ class VidaaTVRemote(VidaaTVEntity, RemoteEntity):
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the TV off."""
         await self.coordinator.async_turn_off()
+
+    async def async_send_key_service(self, key: str) -> None:
+        """Handle the vidaa_tv.send_key service for THIS TV."""
+        _LOGGER.debug("send_key service: %s", key)
+        await self.coordinator.async_send_key(key)
+
+    async def async_launch_app_service(self, app: str) -> None:
+        """Handle the vidaa_tv.launch_app service for THIS TV."""
+        _LOGGER.debug("launch_app service: %s", app)
+        await self.coordinator.async_launch_app(app)
 
     async def async_send_command(self, command: Iterable[str], **kwargs: Any) -> None:
         """Send remote commands.
