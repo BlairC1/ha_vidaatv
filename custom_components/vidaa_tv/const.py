@@ -15,6 +15,11 @@ CONF_BRAND: Final = "brand"
 CONF_SW_VERSION: Final = "sw_version"
 CONF_CERTFILE: Final = "certfile"
 CONF_KEYFILE: Final = "keyfile"
+# Hardware MAC of the interface the TV is actually connected on, learned from
+# getdeviceinfo and PERSISTED so Wake-on-LAN still works when the TV is in deep
+# standby (we can only learn it while the TV is reachable, but we only need it
+# when it is not).
+CONF_HW_MAC: Final = "hw_mac"
 
 # Default values
 DEFAULT_PORT: Final = 36669
