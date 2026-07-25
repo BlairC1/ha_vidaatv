@@ -59,5 +59,4 @@ PLATFORMS: Final = [
     "remote",
     "sensor",
     "binary_sensor",
-    "button",
 ]
