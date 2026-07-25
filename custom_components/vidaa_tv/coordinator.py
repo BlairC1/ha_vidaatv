@@ -75,6 +75,10 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_is_on: bool | None = None  # last authoritative power state
         self._volume_task = None              # in-flight ARC volume stepping task
         self._volume_target: int | None = None
+        # ARC volume instrumentation (see VOLDBG lines in the debug log)
+        self._vol_debug = True
+        self._press_count = 0
+        self._last_press_ts: float = 0.0
         self._source_cache: list[dict] = []  # full sourcelist from last good poll
         self._hw_mac: str | None = None       # real hardware MAC for Wake-on-LAN
         self._tv_info: dict[str, Any] = {}    # last gettvinfo payload
@@ -238,12 +242,22 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     payload = json.loads(msg.payload.decode("utf-8", "replace"))
                     vtype = int(payload.get("volume_type", 0))
                     vval = int(payload.get("volume_value", 0))
-                    self._live_volume_ts = time.monotonic()
+                    now = time.monotonic()
                     if vtype in (0, 1):
+                        # Instrumentation for ARC volume tuning: how long after a
+                        # key press does the TV actually report the new level?
+                        if self._vol_debug and self._last_press_ts:
+                            _LOGGER.debug(
+                                "VOLDBG broadcast type=%s value=%s (%.0f ms after "
+                                "press #%s, live was %s)",
+                                vtype, vval, (now - self._last_press_ts) * 1000,
+                                self._press_count, self._live_volume,
+                            )
                         self._live_volume = vval
                         self._live_volume_type = vtype
                     elif vtype == 2:
                         self._live_muted = bool(vval)
+                    self._live_volume_ts = now
                 elif "ui_service/state" in msg.topic:
                     payload = json.loads(msg.payload.decode("utf-8", "replace"))
                     st = payload.get("statetype")
@@ -634,23 +648,61 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if step_size <= 0:
             step_size = 1.0
 
+        started = time.monotonic()
+        start_volume = self._live_volume
+        self._press_count = 0
+        _LOGGER.debug(
+            "VOLDBG start: live=%s target=%s step_size=%s delay=%ss",
+            start_volume, self._volume_target, step_size, self._VOLUME_STEP_DELAY,
+        )
+
         guard = 0
         while guard < self._MAX_VOLUME_STEPS:
             guard += 1
             target = self._volume_target
             current = self._live_volume
             if target is None or current is None:
+                _LOGGER.debug("VOLDBG abort: target=%s live=%s", target, current)
                 break
             delta = target - int(current)
-            # Within one step of target -> close enough, stop.
             if abs(delta) < step_size:
+                _LOGGER.debug(
+                    "VOLDBG stop: live=%s target=%s delta=%s < step_size=%s "
+                    "after %s presses in %.2fs",
+                    current, target, delta, step_size, self._press_count,
+                    time.monotonic() - started,
+                )
                 break
+            direction = "up" if delta > 0 else "down"
             step = self.tv.async_volume_up if delta > 0 else self.tv.async_volume_down
+            self._press_count += 1
+            self._last_press_ts = time.monotonic()
+            _LOGGER.debug(
+                "VOLDBG press #%s %s: live=%s target=%s delta=%s "
+                "(age of live reading: %.0f ms)",
+                self._press_count, direction, current, target, delta,
+                (self._last_press_ts - self._live_volume_ts) * 1000
+                if self._live_volume_ts else -1,
+            )
             await step()
             await asyncio.sleep(self._VOLUME_STEP_DELAY)
+        else:
+            _LOGGER.debug("VOLDBG hit MAX_VOLUME_STEPS guard (%s)",
+                          self._MAX_VOLUME_STEPS)
 
-        _LOGGER.debug("ARC volume settled near %s (live=%s)",
-                      self._volume_target, self._live_volume)
+        # Let the last broadcasts land, then report where we actually ended up.
+        await asyncio.sleep(1.0)
+        overshoot = (
+            (self._live_volume - self._volume_target)
+            if self._live_volume is not None and self._volume_target is not None
+            else None
+        )
+        _LOGGER.debug(
+            "VOLDBG end: start=%s target=%s final=%s overshoot=%s presses=%s "
+            "elapsed=%.2fs",
+            start_volume, self._volume_target, self._live_volume, overshoot,
+            self._press_count, time.monotonic() - started,
+        )
         await self.async_request_refresh()
 
     async def async_select_source(self, source: str) -> None:
