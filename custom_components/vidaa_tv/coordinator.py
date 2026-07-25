@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
+import json
 import logging
+import time
 from datetime import timedelta
 from typing import Any
 
@@ -74,6 +77,8 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._volume_target: int | None = None
         self._source_cache: list[dict] = []  # full sourcelist from last good poll
         self._hw_mac: str | None = None       # real hardware MAC for Wake-on-LAN
+        self._tv_info: dict[str, Any] = {}    # last gettvinfo payload
+        self._poll_count = 0                  # drives the app-list refresh cadence
         self._apps_cache: list[dict] = []    # full app list from last good fetch
         # Live-TV channel info, captured from the transient `livetv` broadcast.
         # The TV emits livetv then immediately sourceswitch/app, so the cached
@@ -152,6 +157,10 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 device_registry.async_update_device(device_entry.id, **updates)
                 _LOGGER.debug("Refreshed existing device %s: %s", device_entry.id, updates)
 
+    # applist is near-static (it only changes when apps are installed/removed),
+    # so refresh it every N polls rather than on every cycle.
+    _APP_REFRESH_EVERY = 20
+
     # Safety cap on emulated volume stepping (see async_set_volume).
     # --- volume stepping (used when audio is routed over ARC/eARC) -------------
     # The TV has no absolute-volume command for an external amp: it relays CEC
@@ -221,8 +230,6 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if getattr(client, "_vidaa_vol_hook", False):
             return
 
-        import json
-
         previous = client.on_message
 
         def _hook(c, userdata, msg):
@@ -231,8 +238,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     payload = json.loads(msg.payload.decode("utf-8", "replace"))
                     vtype = int(payload.get("volume_type", 0))
                     vval = int(payload.get("volume_value", 0))
-                    import time as _t
-                    self._live_volume_ts = _t.monotonic()
+                    self._live_volume_ts = time.monotonic()
                     if vtype in (0, 1):
                         self._live_volume = vval
                         self._live_volume_type = vtype
@@ -266,7 +272,6 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from TV."""
-        import asyncio, time
         start = time.monotonic()
 
         try:
@@ -314,12 +319,12 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             
 
             
-            # Get current state
-            state_start = time.monotonic()
-            state = await self.tv.async_get_state(timeout=0.5)
-            _LOGGER.debug("get_state took %.2fs, raw state: %s", time.monotonic() - state_start, state)
-            # NOTE: this firmware never answers gettvstate; the call returns the
-            # cached broadcast/connect-push value, so a long timeout only wastes time.
+            # Current state, read from the client's cache - NOT via a query.
+            # This firmware never answers gettvstate, so async_get_state() simply
+            # burned its full timeout (a measured 0.50s of every poll) and then
+            # returned this same cached dict, which the broadcast handler keeps
+            # up to date. Reading the property is free and identical.
+            state = self.tv.state or {}
 
             # --- live source query (sourcelist answers; gettvstate does not) ----
             # Verified: get_sources() replies in ~0.5s on
@@ -328,34 +333,62 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # the selection even to an input with nothing plugged in). This is a
             # real on-demand query, so the source stays correct even when the
             # one-shot broadcast the TV sends at power-on is missed.
+            # Run the real queries CONCURRENTLY. They are independent, so the
+            # poll costs the slowest one (~0.5s) instead of their sum.
+            #   sourcelist -> current input (is_signal == "1")
+            #   gettvinfo  -> authoritative power state (fake_sleep_state)
+            #   applist    -> installed apps; near-static, so only refreshed
+            #                 every APP_REFRESH_EVERY polls (or while unknown)
+            self._poll_count += 1
+            want_apps = (
+                not self._apps_cache
+                or self._poll_count % self._APP_REFRESH_EVERY == 0
+            )
+            query_start = time.monotonic()
+            tasks = [
+                self.tv.async_get_sources(timeout=6),
+                self.tv.async_get_tv_info(timeout=5),
+            ]
+            if want_apps:
+                tasks.append(self.tv.async_get_apps())
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            sources_res = results[0]
+            tv_info_res = results[1]
+            apps_res = results[2] if want_apps else None
+
+            # --- current input, from sourcelist ---------------------------------
+            # Verified: sourcelist replies in ~0.5s on
+            #   /remoteapp/mobile/<client>/ui_service/data/sourcelist
+            # and marks the SELECTED input with is_signal == "1" (the flag follows
+            # the selection even to an input with nothing plugged in). A real
+            # query, so the source stays correct even when the one-shot broadcast
+            # the TV sends at power-on is missed.
             active_source = None
             active_source_detail = None
-            try:
-                src_start = time.monotonic()
-                sources = await self.tv.async_get_sources(timeout=6)
-                if sources and isinstance(sources, list):
-                    # Retain the full list so entities don't each re-fetch it
-                    # (that raced and, on slower firmware, kept coming back empty).
-                    self._source_cache = sources
-                    for s_ in sources:
-                        if str(s_.get("is_signal")) == "1":
-                            active_source = s_.get("displayname") or s_.get("sourcename")
-                            active_source_detail = s_.get("displayname2") or None
-                            break
-                _LOGGER.debug("get_sources took %.2fs, active source: %s",
-                              time.monotonic() - src_start, active_source)
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.debug("get_sources failed: %s", err)
+            if isinstance(sources_res, Exception):
+                _LOGGER.debug("get_sources failed: %s", sources_res)
+            elif sources_res and isinstance(sources_res, list):
+                # Retain the full list so entities don't each re-fetch it (that
+                # raced and, on slower firmware, kept coming back empty).
+                self._source_cache = sources_res
+            for src in self._source_cache:
+                if str(src.get("is_signal")) == "1":
+                    active_source = src.get("displayname") or src.get("sourcename")
+                    active_source_detail = src.get("displayname2") or None
+                    break
 
-            # Refresh the app cache on the same poll so data["apps"] is populated
-            # from the coordinator's own cycle (not only when an entity asks).
-            try:
-                apps = await self.tv.async_get_apps()
-                if apps and isinstance(apps, list):
-                    self._apps_cache = apps
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.debug("get_apps failed: %s", err)
-            # --- end live source query ------------------------------------------
+            # --- installed apps -------------------------------------------------
+            if apps_res is not None:
+                if isinstance(apps_res, Exception):
+                    _LOGGER.debug("get_apps failed: %s", apps_res)
+                elif apps_res and isinstance(apps_res, list):
+                    self._apps_cache = apps_res
+
+            _LOGGER.debug(
+                "queries took %.2fs (apps refreshed: %s), active source: %s",
+                time.monotonic() - query_start, want_apps, active_source,
+            )
 
             # --- authoritative power state: live gettvinfo query -------------
             # gettvinfo answers on a per-client data topic and reports the TV's
@@ -368,23 +401,25 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # poisoned by the fake_sleep_* frame the TV pushes on every connect.
             # Fall back to the cached statetype only if the query fails.
             is_on = None
-            try:
-                info_start = time.monotonic()
-                tv_info = await self.tv.async_get_tv_info(timeout=5)
-                if tv_info:
-                    self._hw_mac = (
-                        tv_info.get("eth0") or tv_info.get("wifi_mac")
-                        or tv_info.get("mac") or self._hw_mac
-                    )
-                if tv_info and "fake_sleep_state" in tv_info:
-                    is_on = str(tv_info.get("fake_sleep_state")) == "1"
+            if isinstance(tv_info_res, Exception):
+                _LOGGER.debug("gettvinfo failed: %s", tv_info_res)
+            elif tv_info_res:
+                # Capture the REAL hardware MAC for Wake-on-LAN. Distinct from
+                # device_id, which on some models is the opaque gettvinfo
+                # `deviceid` string (not a MAC) - that silently disabled WoL.
+                self._hw_mac = (
+                    tv_info_res.get("eth0")
+                    or tv_info_res.get("wifi_mac")
+                    or tv_info_res.get("mac")
+                    or self._hw_mac
+                )
+                self._tv_info = tv_info_res
+                if "fake_sleep_state" in tv_info_res:
+                    is_on = str(tv_info_res.get("fake_sleep_state")) == "1"
                     _LOGGER.debug(
-                        "gettvinfo took %.2fs, fake_sleep_state=%s -> is_on=%s",
-                        time.monotonic() - info_start,
-                        tv_info.get("fake_sleep_state"), is_on,
+                        "fake_sleep_state=%s -> is_on=%s",
+                        tv_info_res.get("fake_sleep_state"), is_on,
                     )
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.debug("gettvinfo failed: %s", err)
 
             if is_on is not None:
                 # gettvinfo answered - this is authoritative. Remember it.
@@ -412,34 +447,13 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     )
             # --- end power state ----------------------------------------------
 
-            # Get volume and mute status (only if TV is on)
-            # Note: getvolume request may not work on all TVs, but volume is cached
-            # from volumechange broadcasts when user changes volume
-            volume = None
-            is_muted = False
-
-            # Probe volume unconditionally: publishing getvolume makes an ON TV
-            # broadcast its volume, so a fresh broadcast is a live "TV is on"
-            # signal. (Do not gate this on is_on - that is what we are testing.)
-            probe_before = self._live_volume_ts
-            try:
-                vol_start = time.monotonic()
-                await self.tv.async_get_volume(timeout=1.0)
-                is_muted = self.tv.is_muted
-                _LOGGER.debug("get_volume probe took %.2fs", time.monotonic() - vol_start)
-            except Exception as err:
-                _LOGGER.debug("get_volume failed: %s", err)
-
-            # NOTE: volume broadcasts are NOT a power signal. Measured on both
-            # TVs while OFF: statetype=fake_sleep_0 yet volume_answered=True, i.e.
-            # a TV in standby still answers getvolume. Do not use this to infer
-            # power state - it only ever produced false "on".
-            volume_answered = self._live_volume_ts > probe_before
-
-            if self._live_volume is not None:
-                volume = self._live_volume
-            if self._live_muted:
-                is_muted = True
+            # Volume and mute come from the MQTT broadcast hook, not a query.
+            # getvolume is never answered by this firmware, and is_muted is a
+            # plain cached property - so the old probe was pure overhead. (It
+            # also is NOT a power signal: measured on both TVs while OFF, a TV
+            # in standby still emits volume broadcasts.)
+            volume = self._live_volume
+            is_muted = self._live_muted or self.tv.is_muted
 
             # Build data dict
             # State contains 'statetype' which indicates current activity:
@@ -447,7 +461,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # - 'sourceswitch': watching a source (has 'sourceid', 'sourcename' fields)
             # - 'remote_launcher': at home screen
             # - 'fake_sleep_0': TV is off/sleeping
-            statetype = state.get("statetype") if state else None
+            statetype = state.get("statetype")
 
             # Extract current app or source based on statetype
             app = None
@@ -488,6 +502,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "source": source,
                 "source_detail": source_detail,
                 "sources": list(self._source_cache),
+                "tv_info": dict(self._tv_info),
                 "apps": list(self._apps_cache),
                 "channel_name": channel_name,
                 "channel_num": channel_num,
@@ -495,9 +510,8 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             }
 
             _LOGGER.debug(
-                "State data: is_on=%s, statetype=%s, volume=%s, app=%s, source=%s, "
-                "volume_answered=%s",
-                is_on, statetype, volume, app, source, volume_answered,
+                "State data: is_on=%s, statetype=%s, volume=%s, app=%s, source=%s",
+                is_on, statetype, volume, app, source,
             )
             _LOGGER.debug("Total update took %.2fs", time.monotonic() - start)
             return data
@@ -575,8 +589,6 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         background task: a new target cancels the in-flight one and re-aims, so we
         always converge on the LATEST value instead of stacking loops that fight.
         """
-        import asyncio
-
         target = max(0, min(100, int(volume)))
 
         # TV speakers (or no reading yet): absolute works - fire and forget.
@@ -599,7 +611,6 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_step_volume_arc(self) -> None:
         """Step ARC volume toward self._volume_target, re-reading it each pass so a
         slider drag converges on the final value instead of overshooting."""
-        import asyncio
         try:
             step_size = float(
                 self.entry.options.get("volume_step_size", self._VOLUME_STEP_SIZE)

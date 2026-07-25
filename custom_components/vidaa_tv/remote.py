@@ -6,22 +6,16 @@ import logging
 from typing import TYPE_CHECKING, Any, Iterable
 
 from homeassistant.components.remote import RemoteEntity, RemoteEntityFeature
-from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.device_registry import DeviceInfo, CONNECTION_NETWORK_MAC
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
-    DOMAIN,
-    CONF_DEVICE_ID,
-    CONF_MODEL,
-    CONF_SW_VERSION,
-    DEFAULT_NAME,
     ACTIVITY_HOME,
     STATE_REMOTE_LAUNCHER,
 )
 from .coordinator import VidaaTVDataUpdateCoordinator
+from .entity import VidaaTVEntity
+from .helpers import build_source_list, resolve_source_id
 
 # Import key utilities from the library
 from pyvidaa.keys import get_key
@@ -45,7 +39,7 @@ async def async_setup_entry(
     async_add_entities([VidaaTVRemote(coordinator, entry)])
 
 
-class VidaaTVRemote(CoordinatorEntity[VidaaTVDataUpdateCoordinator], RemoteEntity):
+class VidaaTVRemote(VidaaTVEntity, RemoteEntity):
     """Representation of a Hisense TV remote."""
 
     _attr_has_entity_name = True
@@ -58,102 +52,10 @@ class VidaaTVRemote(CoordinatorEntity[VidaaTVDataUpdateCoordinator], RemoteEntit
         entry: ConfigEntry,
     ) -> None:
         """Initialize the remote."""
-        super().__init__(coordinator)
-        self._entry = entry
-        self._device_id = entry.data.get(CONF_DEVICE_ID)
-        self._attr_unique_id = f"{self._device_id}_remote" if self._device_id else f"{entry.entry_id}_remote"
-        self._apps: list[dict] = []
-        self._sources: list[dict] = []
-        self._activity_list: list[str] = []
-
-    async def async_added_to_hass(self) -> None:
-        """Run when entity is added to hass."""
-        await super().async_added_to_hass()
-        await self._async_update_activities()
-
-    def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator."""
-        # If TV is on and we don't have activities yet, try to fetch them
-        if (
-            self.coordinator.data
-            and self.coordinator.data.get("is_on")
-            and (not self._sources or not self._apps)
-        ):
-            self.hass.async_create_task(self._async_update_activities())
-        super()._handle_coordinator_update()
-
-    async def _async_update_activities(self) -> None:
-        """Update activity list from TV.
-
-        Activities are the launchable apps PLUS the physical input sources, so an
-        HDMI input can be selected from the remote as well as the media player.
-        Sources are listed by displayname ("Onkyo AVR") to match what the
-        coordinator reports as the current activity.
-        """
-        try:
-            # Sources and apps come from two independent queries, either of which
-            # can transiently fail. Update each category only when its fetch
-            # succeeds, then rebuild the combined list from BOTH retained lists -
-            # so an empty fetch of one never drops the other.
-            sources = await self.coordinator.async_get_sources()
-            if sources and isinstance(sources, list):
-                self._sources = sources
-
-            apps = await self.coordinator.async_get_apps()
-            if apps and isinstance(apps, list):
-                self._apps = apps
-
-            activities: list[str] = []
-            for src in self._sources:
-                if isinstance(src, dict):
-                    name = src.get("displayname") or src.get("sourcename")
-                    if name and name not in activities:
-                        activities.append(name)
-            for app in self._apps:
-                if isinstance(app, dict):
-                    name = app.get("name")
-                    if name and name not in activities:
-                        activities.append(name)
-
-            if activities:
-                self._activity_list = activities
-                _LOGGER.debug(
-                    "Updated activity list: %d inputs + %d apps = %d entries",
-                    len(self._sources), len(self._apps), len(activities),
-                )
-        except Exception as err:
-            _LOGGER.debug("Error updating activities: %s", err)
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        """Return device info, preferring the TV's live values."""
-        data = self.coordinator.device_data
-        # Stable identity: keep the existing identifier (device_id or entry_id);
-        # do not switch to a MAC for existing installs (would orphan the device).
-        device_id = self._entry.data.get(CONF_DEVICE_ID) or self._entry.entry_id
-        mac_src = data.get("device_id") or self._entry.data.get(CONF_DEVICE_ID)
-        mac = self._format_mac(mac_src) if mac_src else None
-
-        info = DeviceInfo(
-            identifiers={(DOMAIN, device_id)},
-            name=data.get("name") or self._entry.data.get(CONF_NAME, DEFAULT_NAME),
-            manufacturer="Hisense",
-            model=data.get("model") or self._entry.data.get(CONF_MODEL),
-            sw_version=data.get("sw_version") or self._entry.data.get(CONF_SW_VERSION),
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = (
+            f"{self._device_id}_remote" if self._device_id else f"{entry.entry_id}_remote"
         )
-
-        if mac:
-            info["connections"] = {(CONNECTION_NETWORK_MAC, mac)}
-        if data.get("ip"):
-            info["configuration_url"] = f"http://{data['ip']}"
-
-        return info
-
-    def _format_mac(self, device_id: str) -> str | None:
-        """Format device_id as MAC address."""
-        if not device_id or len(device_id) != 12:
-            return None
-        return ":".join(device_id[i:i+2] for i in range(0, 12, 2)).upper()
 
     @property
     def available(self) -> bool:
@@ -186,18 +88,10 @@ class VidaaTVRemote(CoordinatorEntity[VidaaTVDataUpdateCoordinator], RemoteEntit
     def activity_list(self) -> list[str] | None:
         """Home + inputs + apps, derived from coordinator data (no local fetch)."""
         data = self.coordinator.data or {}
-        activities: list[str] = []
-        for src in data.get("sources") or []:
-            if isinstance(src, dict):
-                name = src.get("displayname") or src.get("sourcename")
-                if name and name not in activities:
-                    activities.append(name)
-        for app in data.get("apps") or []:
-            if isinstance(app, dict):
-                name = app.get("name")
-                if name and name not in activities:
-                    activities.append(name)
-        return [ACTIVITY_HOME, *activities]
+        return [
+            ACTIVITY_HOME,
+            *build_source_list(data.get("sources"), data.get("apps")),
+        ]
 
     async def async_turn_on(self, activity: str | None = None, **kwargs: Any) -> None:
         """Turn the TV on and optionally start an activity."""
@@ -208,14 +102,11 @@ class VidaaTVRemote(CoordinatorEntity[VidaaTVDataUpdateCoordinator], RemoteEntit
         elif activity:
             # An activity may be an input source or an app. Check sources first and
             # switch input using the TV's own source id; otherwise launch the app.
-            known = (self.coordinator.data or {}).get("sources") or self._sources
-            for src in known:
-                if not isinstance(src, dict):
-                    continue
-                if activity in (src.get("displayname"), src.get("sourcename")):
-                    target = src.get("sourceid") or src.get("sourcename") or activity
-                    await self.coordinator.async_select_source(target)
-                    return
+            data = self.coordinator.data or {}
+            source_id = resolve_source_id(activity, data.get("sources"))
+            if source_id:
+                await self.coordinator.async_select_source(source_id)
+                return
             await self.coordinator.async_launch_app(activity)
 
     async def async_turn_off(self, **kwargs: Any) -> None:

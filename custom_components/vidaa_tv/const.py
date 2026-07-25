@@ -49,4 +49,10 @@ STATE_REMOTE_LAUNCHER: Final = "remote_launcher"  # TV at the home screen
 ACTIVITY_HOME: Final = "Home"
 
 # Platform types
-PLATFORMS: Final = ["media_player", "remote"]
+PLATFORMS: Final = [
+    "media_player",
+    "remote",
+    "sensor",
+    "binary_sensor",
+    "button",
+]

@@ -6,26 +6,25 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.media_player import (
+    BrowseMedia,
+    MediaClass,
     MediaPlayerDeviceClass,
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaType,
     MediaPlayerState,
 )
-from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.device_registry import DeviceInfo, CONNECTION_NETWORK_MAC
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import (
-    DOMAIN,
-    CONF_DEVICE_ID,
-    CONF_MODEL,
-    CONF_SW_VERSION,
-    DEFAULT_NAME,
-)
 from .coordinator import VidaaTVDataUpdateCoordinator
+from .entity import VidaaTVEntity
+from .helpers import (
+    app_icon_url,
+    build_source_list,
+    find_app,
+    resolve_source_id,
+)
 
 if TYPE_CHECKING:
     from . import VidaaTVConfigEntry
@@ -45,7 +44,7 @@ async def async_setup_entry(
     async_add_entities([VidaaTVMediaPlayer(coordinator, entry)])
 
 
-class VidaaTVMediaPlayer(CoordinatorEntity[VidaaTVDataUpdateCoordinator], MediaPlayerEntity):
+class VidaaTVMediaPlayer(VidaaTVEntity, MediaPlayerEntity):
     """Representation of a Hisense TV media player."""
 
     _attr_device_class = MediaPlayerDeviceClass.TV
@@ -63,6 +62,11 @@ class VidaaTVMediaPlayer(CoordinatorEntity[VidaaTVDataUpdateCoordinator], MediaP
         | MediaPlayerEntityFeature.PAUSE
         | MediaPlayerEntityFeature.STOP
         | MediaPlayerEntityFeature.PLAY_MEDIA
+        # These are implemented below but were previously undeclared, so the
+        # frontend never rendered the buttons.
+        | MediaPlayerEntityFeature.NEXT_TRACK
+        | MediaPlayerEntityFeature.PREVIOUS_TRACK
+        | MediaPlayerEntityFeature.BROWSE_MEDIA
     )
 
     def __init__(
@@ -71,46 +75,10 @@ class VidaaTVMediaPlayer(CoordinatorEntity[VidaaTVDataUpdateCoordinator], MediaP
         entry: VidaaTVConfigEntry,
     ) -> None:
         """Initialize the media player."""
-        super().__init__(coordinator)
-        self._entry = entry
-        self._device_id = entry.data.get(CONF_DEVICE_ID)
-        self._attr_unique_id = f"{self._device_id}_media_player" if self._device_id else entry.entry_id
-
-        # Source and app caches
-        self._sources: list[str] = []
-        self._apps: list[dict] = []
-        self._source_list: list[str] = []
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        """Return device info, preferring the TV's live values."""
-        data = self.coordinator.device_data
-        # Stable identity: keep the existing identifier (device_id or entry_id);
-        # do not switch to a MAC for existing installs (would orphan the device).
-        device_id = self._entry.data.get(CONF_DEVICE_ID) or self._entry.entry_id
-        mac_src = data.get("device_id") or self._entry.data.get(CONF_DEVICE_ID)
-        mac = self._format_mac(mac_src) if mac_src else None
-
-        info = DeviceInfo(
-            identifiers={(DOMAIN, device_id)},
-            name=data.get("name") or self._entry.data.get(CONF_NAME, DEFAULT_NAME),
-            manufacturer="Hisense",
-            model=data.get("model") or self._entry.data.get(CONF_MODEL),
-            sw_version=data.get("sw_version") or self._entry.data.get(CONF_SW_VERSION),
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = (
+            f"{self._device_id}_media_player" if self._device_id else entry.entry_id
         )
-
-        if mac:
-            info["connections"] = {(CONNECTION_NETWORK_MAC, mac)}
-        if data.get("ip"):
-            info["configuration_url"] = f"http://{data['ip']}"
-
-        return info
-
-    def _format_mac(self, device_id: str) -> str | None:
-        """Format device_id as MAC address."""
-        if not device_id or len(device_id) != 12:
-            return None
-        return ":".join(device_id[i:i+2] for i in range(0, 12, 2)).upper()
 
     @property
     def available(self) -> bool:
@@ -172,6 +140,19 @@ class VidaaTVMediaPlayer(CoordinatorEntity[VidaaTVDataUpdateCoordinator], MediaP
         )
 
     @property
+    def media_image_url(self) -> str | None:
+        """Icon of the running app, if the TV gave us one.
+
+        applist entries carry an ``httpIcon`` field that we already fetch but
+        never used; it embeds a real image URL after a data-URI prefix.
+        """
+        data = self.coordinator.data or {}
+        app_name = data.get("app")
+        if not app_name:
+            return None
+        return app_icon_url(find_app(app_name, data.get("apps")))
+
+    @property
     def media_channel(self) -> str | None:
         """Channel currently tuned, e.g. "7Bravo Melbourne"."""
         if not self.coordinator.data:
@@ -198,25 +179,14 @@ class VidaaTVMediaPlayer(CoordinatorEntity[VidaaTVDataUpdateCoordinator], MediaP
 
     @property
     def source_list(self) -> list[str] | None:
-        """Inputs + apps, built directly from coordinator data (no local fetch).
+        """Inputs + apps, derived from coordinator data (no per-entity fetch).
 
-        The coordinator already queries sources and apps every poll and publishes
-        them in its data, so we derive the list here. This removes the per-entity
-        re-fetch that raced and returned empty on slower firmware.
+        The coordinator queries both every poll and publishes them, so there is
+        nothing to fetch or cache here - which removes the races that used to
+        make inputs or apps vanish from the dropdown.
         """
         data = self.coordinator.data or {}
-        names: list[str] = []
-        for src in data.get("sources") or []:
-            if isinstance(src, dict):
-                name = (src.get("displayname") or src.get("sourcename")
-                        or src.get("name"))
-                if name and name not in names:
-                    names.append(name)
-        for app in data.get("apps") or []:
-            if isinstance(app, dict):
-                name = app.get("name")
-                if name and name not in names:
-                    names.append(name)
+        names = build_source_list(data.get("sources"), data.get("apps"))
         return names or None
 
     @property
@@ -225,67 +195,6 @@ class VidaaTVMediaPlayer(CoordinatorEntity[VidaaTVDataUpdateCoordinator], MediaP
         if not self.coordinator.data:
             return None
         return self.coordinator.data.get("app")
-
-    async def async_added_to_hass(self) -> None:
-        """Run when entity is added to hass."""
-        await super().async_added_to_hass()
-        # Fetch sources and apps
-        await self._async_update_sources()
-
-    def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator."""
-        # Keep fetching until we have BOTH inputs and apps: they come from two
-        # separate queries, either of which can transiently fail, so retry while
-        # either is still missing (not merely while the combined list is empty).
-        if (
-            self.coordinator.data
-            and self.coordinator.data.get("is_on")
-            and (not self._sources or not self._apps)
-        ):
-            self.hass.async_create_task(self._async_update_sources())
-        super()._handle_coordinator_update()
-
-    async def _async_update_sources(self) -> None:
-        """Update source list from TV."""
-        try:
-            # Update each category independently; keep the last good one if a
-            # fetch returns empty (the two queries fail independently).
-            sources = await self.coordinator.async_get_sources()
-            if sources and isinstance(sources, list):
-                self._sources = sources
-
-            apps = await self.coordinator.async_get_apps()
-            if apps and isinstance(apps, list):
-                self._apps = apps
-
-            # Rebuild the combined list from BOTH retained categories every time,
-            # so a transient empty fetch of one never drops the other.
-            combined: list[str] = []
-            for src in self._sources:
-                if isinstance(src, dict):
-                    name = (
-                        src.get("displayname")
-                        or src.get("sourcename")
-                        or src.get("name")
-                        or f"Source {src.get('sourceid', '?')}"
-                    )
-                    if name and name not in combined:
-                        combined.append(name)
-            for app in self._apps:
-                if isinstance(app, dict):
-                    name = app.get("name")
-                    if name and name not in combined:
-                        combined.append(name)
-            if combined:
-                self._source_list = combined
-
-            _LOGGER.debug(
-                "Updated source list: %d inputs + %d apps = %d entries",
-                len(self._sources), len(self._apps), len(self._source_list),
-            )
-
-        except Exception as err:
-            _LOGGER.debug("Error updating sources: %s", err)
 
     async def async_turn_on(self) -> None:
         """Turn the TV on."""
@@ -313,36 +222,29 @@ class VidaaTVMediaPlayer(CoordinatorEntity[VidaaTVDataUpdateCoordinator], MediaP
 
     async def async_select_source(self, source: str) -> None:
         """Select input source."""
-        # Check if it's an app
-        for app in self._apps:
-            if app.get("name") == source:
-                await self.coordinator.async_launch_app(source)
-                return
+        data = self.coordinator.data or {}
+
+        # Apps first: an app name is launched, not switched to.
+        if find_app(source, data.get("apps")):
+            await self.coordinator.async_launch_app(source)
+            return
 
         # Otherwise treat as an input source. source_list holds DISPLAY names
         # (e.g. "Onkyo AVR"), but the TV expects its own source id ("HDMI3"), so
         # map back before sending. Inputs whose display name equals their id
         # (HDMI2, HDMI4) worked without this; named ones did not.
-        def _norm(value: str | None) -> str:
-            return (value or "").strip().casefold()
-
-        wanted = _norm(source)
-        known_sources = (self.coordinator.data or {}).get("sources") or self._sources
-        for src in known_sources:
-            if not isinstance(src, dict):
-                continue
-            names = (src.get("displayname"), src.get("sourcename"), src.get("name"))
-            if wanted in tuple(_norm(n) for n in names):
-                target = src.get("sourceid") or src.get("sourcename") or source
-                _LOGGER.debug("select_source %r -> sourceid %r", source, target)
-                await self.coordinator.async_select_source(target)
-                return
+        sources = data.get("sources")
+        source_id = resolve_source_id(source, sources)
+        if source_id:
+            _LOGGER.debug("select_source %r -> sourceid %r", source, source_id)
+            await self.coordinator.async_select_source(source_id)
+            return
 
         _LOGGER.warning(
-            "select_source %r matched no known source; known=%s",
+            "select_source %r matched no known input; known=%s",
             source,
             [(x.get("displayname"), x.get("sourceid"))
-             for x in self._sources if isinstance(x, dict)],
+             for x in (sources or []) if isinstance(x, dict)],
         )
         await self.coordinator.async_select_source(source)
 
@@ -365,6 +267,41 @@ class VidaaTVMediaPlayer(CoordinatorEntity[VidaaTVDataUpdateCoordinator], MediaP
     async def async_media_previous_track(self) -> None:
         """Send previous track command."""
         await self.coordinator.async_send_key("KEY_REWIND")
+
+    async def async_browse_media(
+        self,
+        media_content_type: str | None = None,
+        media_content_id: str | None = None,
+    ) -> BrowseMedia:
+        """Browse the TV's installed apps.
+
+        Lets apps be launched from the media browser (and picked up by
+        media_player.play_media with media_content_type "app").
+        """
+        apps = (self.coordinator.data or {}).get("apps") or []
+        children = [
+            BrowseMedia(
+                title=app.get("name"),
+                media_class=MediaClass.APP,
+                media_content_type=MediaType.APP,
+                media_content_id=app.get("name"),
+                can_play=True,
+                can_expand=False,
+                thumbnail=app_icon_url(app),
+            )
+            for app in apps
+            if isinstance(app, dict) and app.get("name")
+        ]
+        return BrowseMedia(
+            title="Apps",
+            media_class=MediaClass.DIRECTORY,
+            media_content_type=MediaType.APPS,
+            media_content_id="apps",
+            can_play=False,
+            can_expand=True,
+            children=children,
+            children_media_class=MediaClass.APP,
+        )
 
     async def async_play_media(
         self, media_type: str, media_id: str, **kwargs: Any
