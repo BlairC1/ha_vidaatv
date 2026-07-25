@@ -261,12 +261,21 @@ class VidaaTVMediaPlayer(VidaaTVEntity, MediaPlayerEntity):
         await self.coordinator.async_send_key("KEY_STOP")
 
     async def async_media_next_track(self) -> None:
-        """Send next track command."""
-        await self.coordinator.async_send_key("KEY_FAST_FORWARD")
+        """Skip forward.
+
+        Tested on 65E86GEVS (HDMI -> AVR -> Fire TV): KEY_FAST_FORWARD and
+        KEY_REWIND are NOT actioned, while KEY_RIGHT/KEY_LEFT are - streaming
+        apps map the directional keys to seek during playback. So these send the
+        directional keys, which work, rather than the transport keys, which do
+        nothing. Swap back to KEY_FAST_FORWARD/KEY_REWIND if your TV plays media
+        itself and honours them.
+        """
+        await self.coordinator.async_send_key("KEY_RIGHT")
 
     async def async_media_previous_track(self) -> None:
-        """Send previous track command."""
-        await self.coordinator.async_send_key("KEY_REWIND")
+        """Skip backward (see async_media_next_track for why KEY_LEFT)."""
+        await self.coordinator.async_send_key("KEY_LEFT")
+
 
     async def async_browse_media(
         self,
