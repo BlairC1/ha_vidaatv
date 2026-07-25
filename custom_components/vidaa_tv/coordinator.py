@@ -18,7 +18,16 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from pyvidaa import APPS
 from pyvidaa.wol import wake_tv
-from .const import DOMAIN, SCAN_INTERVAL, STATE_FAKE_SLEEP, CONF_DEVICE_ID, CONF_HOST
+from .const import (
+    CONF_DEVICE_ID,
+    DEFAULT_PORT,
+    CONF_PORT,
+    CONF_HOST,
+    CONF_HW_MAC,
+    DOMAIN,
+    SCAN_INTERVAL,
+    STATE_FAKE_SLEEP,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -80,7 +89,9 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._press_count = 0
         self._last_press_ts: float = 0.0
         self._source_cache: list[dict] = []  # full sourcelist from last good poll
-        self._hw_mac: str | None = None       # real hardware MAC for Wake-on-LAN
+        # Seed from the persisted value so WoL works even if the TV has been
+        # in deep standby since before Home Assistant started.
+        self._hw_mac: str | None = entry.data.get(CONF_HW_MAC)
         self._tv_info: dict[str, Any] = {}    # last gettvinfo payload
         self._poll_count = 0                  # drives the app-list refresh cadence
         self._apps_cache: list[dict] = []    # full app list from last good fetch
@@ -150,12 +161,18 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 info.get("eth0") or info.get("mac") or info.get("wlan0")
                 or info.get("wifi_mac")
             )
-        if preferred:
+        if preferred and preferred != self._hw_mac:
             self._hw_mac = preferred
             _LOGGER.debug(
                 "WoL target MAC %s (network_type=%r -> %s interface)",
                 preferred, info.get("network_type"),
                 "wireless" if wireless else "wired",
+            )
+            # Persist it: this is the only time we can learn it (the TV must be
+            # reachable), but WoL needs it precisely when the TV is not.
+            self.hass.config_entries.async_update_entry(
+                self.entry,
+                data={**self.entry.data, CONF_HW_MAC: preferred},
             )
         self._device_info_fetched = True
         _LOGGER.debug("Cached device info: %s", self.device_data)
@@ -193,6 +210,9 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # there is no fixed inter-press delay to tune - the loop runs at whatever
     # rate the amp actually manages (~0.75s/step measured). These only bound the
     # failure cases.
+    # Reachability probe: a dead host fails in ms, so this is near-free.
+    _PROBE_TIMEOUT = 1.5
+
     _VOLUME_ACK_TIMEOUT = 2.0    # how long to wait for a press to be acknowledged
     _VOLUME_STALL_LIMIT = 3      # consecutive unacknowledged presses before giving up
     _MAX_VOLUME_STEPS = 60       # hard cap on a single volume_set
@@ -302,6 +322,35 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         client._vidaa_vol_hook = True
         _LOGGER.debug("Volume broadcast listener attached")
 
+    async def _async_is_reachable(self) -> bool:
+        """Cheap TCP check: is the TV answering on its control port?
+
+        A full pyvidaa connect against an unreachable TV costs ~3.1s of a SHARED
+        executor thread (measured) and is retried every poll while the TV sits in
+        deep standby. A bare TCP connect fails in milliseconds against a dead
+        host, so we gate the expensive path behind this.
+
+        Deliberately NOT rate-limited: it is cheap enough to run every cycle,
+        which is what keeps power-on detection immediate. Backing off the probe
+        itself would delay noticing that the TV has woken - the exact
+        responsiveness we are trying to protect.
+        """
+        host = self.entry.data.get(CONF_HOST)
+        port = self.entry.data.get(CONF_PORT, DEFAULT_PORT)
+        if not host:
+            return True  # nothing to probe against; let the normal path decide
+        try:
+            fut = asyncio.open_connection(host, port)
+            reader, writer = await asyncio.wait_for(fut, timeout=self._PROBE_TIMEOUT)
+        except (OSError, asyncio.TimeoutError):
+            return False
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except OSError:
+            pass
+        return True
+
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from TV."""
         start = time.monotonic()
@@ -309,7 +358,21 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             # Check connection
             if not self.tv.is_connected:
-                _LOGGER.debug("TV disconnected, rebuilding client and reconnecting")
+                # Cheap reachability gate first: skip the ~3.1s handshake when the
+                # TV is in deep standby, but keep checking every cycle so a wake
+                # is noticed immediately.
+                probe_start = time.monotonic()
+                if not await self._async_is_reachable():
+                    self._available = False
+                    _LOGGER.debug(
+                        "TV unreachable (probe %.0f ms); skipping connect",
+                        (time.monotonic() - probe_start) * 1000,
+                    )
+                    raise UpdateFailed("TV is not reachable (probably off)")
+                _LOGGER.debug(
+                    "TV reachable (probe %.0f ms), reconnecting",
+                    (time.monotonic() - probe_start) * 1000,
+                )
                 # Rebuild the client so saved-token status is re-evaluated; an
                 # expired access token is then refreshed from the refresh token
                 # rather than being replayed and rejected.
@@ -585,8 +648,9 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # getdeviceinfo once the TV has been seen online). Normalize to bare hex so
         # a colon/dash-formatted value still works.
         raw_mac = (
-            self.entry.options.get("wol_mac")     # explicit override wins
-            or self._hw_mac                       # real eth0/wifi MAC (both models)
+            self.entry.options.get("wol_mac")      # explicit override wins
+            or self._hw_mac                        # learned this session
+            or self.entry.data.get(CONF_HW_MAC)    # persisted from a previous run
             or self.entry.data.get(CONF_DEVICE_ID)
             or self.device_data.get("device_id")
         )
