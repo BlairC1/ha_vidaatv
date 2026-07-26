@@ -67,6 +67,8 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.tv = tv
         self.entry = entry
+        # The user-configured interval, restored whenever the TV is on.
+        self._on_interval = timedelta(seconds=scan_interval)
         self._available = True
         self._device_info_fetched = False
         self._auth_failures = 0
@@ -108,6 +110,16 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Parsed device info (model, sw_version, name, ip, device_id) cached from
         # the TV's getdeviceinfo; entities build their DeviceInfo from this.
         self.device_data: dict[str, Any] = {}
+
+    def _set_poll_cadence(self, *, tv_on: bool) -> None:
+        """Poll quickly while the TV is off so a power-on is noticed promptly."""
+        wanted = self._on_interval if tv_on else self._OFF_SCAN_INTERVAL
+        if self.update_interval != wanted:
+            self.update_interval = wanted
+            self.vlog(
+                "Poll interval -> %ss (TV %s)",
+                int(wanted.total_seconds()), "on" if tv_on else "off",
+            )
 
     def vlog(self, msg: str, *args) -> None:
         """Log a verbose line, at INFO when the debug switch is on.
@@ -237,8 +249,17 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # there is no fixed inter-press delay to tune - the loop runs at whatever
     # rate the amp actually manages (~0.75s/step measured). These only bound the
     # failure cases.
-    # Reachability probe: a dead host fails in ms, so this is near-free.
-    _PROBE_TIMEOUT = 1.5
+    # Reachability probe: a refused connection fails in ms. A TV that black-holes
+    # instead runs to this timeout, so keep it short - a TV that is actually awake
+    # answers on the LAN in milliseconds.
+    _PROBE_TIMEOUT = 0.5
+
+    # While the TV is off we only run the cheap probe, so we can afford to check
+    # far more often than the normal poll interval. This is what makes a power-on
+    # show up in seconds instead of waiting out a full cycle. Once the TV is on we
+    # revert to the configured interval, since a real poll is comparatively
+    # expensive (~0.5s of queries).
+    _OFF_SCAN_INTERVAL = timedelta(seconds=8)
 
     _VOLUME_ACK_TIMEOUT = 2.0    # how long to wait for a press to be acknowledged
     _VOLUME_STALL_LIMIT = 3      # consecutive unacknowledged presses before giving up
@@ -391,6 +412,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 probe_start = time.monotonic()
                 if not await self._async_is_reachable():
                     self._available = False
+                    self._set_poll_cadence(tv_on=False)
                     _LOGGER.debug(
                         "TV unreachable (probe %.0f ms); skipping connect",
                         (time.monotonic() - probe_start) * 1000,
@@ -585,6 +607,9 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "gettvinfo unavailable and no prior state; is_on=%s", is_on
                     )
             # --- end power state ----------------------------------------------
+
+            # Fast cadence while off, normal cadence once on.
+            self._set_poll_cadence(tv_on=bool(is_on))
 
             # Volume and mute come from the MQTT broadcast hook, not a query.
             # getvolume is never answered by this firmware, and is_muted is a
