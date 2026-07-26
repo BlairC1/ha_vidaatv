@@ -58,5 +58,5 @@ PLATFORMS: Final = [
     "media_player",
     "remote",
     "sensor",
-    "binary_sensor",
+    "switch",
 ]

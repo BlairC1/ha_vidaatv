@@ -85,7 +85,11 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._volume_task = None              # in-flight ARC volume stepping task
         self._volume_target: int | None = None
         # ARC volume instrumentation (see VOLDBG lines in the debug log)
-        self._vol_debug = False
+        # Toggled by the 'Debug logging' switch: promotes this integration's
+        # verbose lines from DEBUG to INFO so they appear in the HA log
+        # without editing configuration.yaml.
+        self.debug_logging = False
+        self._vol_debug = True
         self._press_count = 0
         self._last_press_ts: float = 0.0
         self._source_cache: list[dict] = []  # full sourcelist from last good poll
@@ -104,6 +108,17 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Parsed device info (model, sw_version, name, ip, device_id) cached from
         # the TV's getdeviceinfo; entities build their DeviceInfo from this.
         self.device_data: dict[str, Any] = {}
+
+    def vlog(self, msg: str, *args) -> None:
+        """Log a verbose line, at INFO when the debug switch is on.
+
+        Home Assistant hides DEBUG unless the logger is configured, so the switch
+        promotes these to INFO rather than requiring a YAML change and restart.
+        """
+        if self.debug_logging:
+            _LOGGER.info(msg, *args)
+        else:
+            _LOGGER.debug(msg, *args)
 
     @property
     def available(self) -> bool:
@@ -223,7 +238,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # rate the amp actually manages (~0.75s/step measured). These only bound the
     # failure cases.
     # Reachability probe: a dead host fails in ms, so this is near-free.
-    _PROBE_TIMEOUT = 0.5
+    _PROBE_TIMEOUT = 1.5
 
     _VOLUME_ACK_TIMEOUT = 2.0    # how long to wait for a press to be acknowledged
     _VOLUME_STALL_LIMIT = 3      # consecutive unacknowledged presses before giving up
@@ -506,7 +521,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 elif apps_res and isinstance(apps_res, list):
                     self._apps_cache = apps_res
 
-            _LOGGER.debug(
+            self.vlog(
                 "queries took %.2fs (apps refreshed: %s), active source: %s",
                 time.monotonic() - query_start, want_apps, active_source,
             )
@@ -625,6 +640,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "app": app,
                 "source": source,
                 "source_detail": source_detail,
+                "volume_type": self._live_volume_type,
                 "sources": list(self._source_cache),
                 "tv_info": dict(self._tv_info),
                 "apps": list(self._apps_cache),
@@ -633,11 +649,11 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "program": program,
             }
 
-            _LOGGER.debug(
+            self.vlog(
                 "State data: is_on=%s, statetype=%s, volume=%s, app=%s, source=%s",
                 is_on, statetype, volume, app, source,
             )
-            _LOGGER.debug("Total update took %.2fs", time.monotonic() - start)
+            self.vlog("Total update took %.2fs", time.monotonic() - start)
             return data
 
         except Exception as err:

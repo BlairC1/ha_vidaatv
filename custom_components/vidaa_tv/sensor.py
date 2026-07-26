@@ -71,23 +71,17 @@ SENSORS: tuple[VidaaSensorDescription, ...] = (
         value_fn=lambda data: data.get("statetype"),
     ),
     VidaaSensorDescription(
-        key="last_state_payload",
-        translation_key="last_state_payload",
-        name="Last state response",
-        icon="mdi:code-json",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-        # The state value is just the statetype (a sensor state cannot exceed
-        # 255 chars); the full decoded payloads live in the attributes.
-        value_fn=lambda data: (data.get("state") or {}).get("statetype"),
-        attrs_fn=lambda data: {
-            # Last ui_service/state frame - broadcast-driven, so this is the most
-            # recent activity change the TV announced.
-            "state": data.get("state") or {},
-            # Last platform_service/data/gettvinfo reply - the live query that
-            # drives power state (fake_sleep_state).
-            "tv_info": data.get("tv_info") or {},
-        },
+        key="audio_output",
+        translation_key="audio_output",
+        name="Audio output",
+        icon="mdi:audio-video",
+        # The TV only broadcasts volume for the ACTIVE output, so the type of the
+        # last volume broadcast tells us where audio is going:
+        #   0 = the TV's own speakers, 1 = ARC/eARC to an external amp.
+        value_fn=lambda data: {
+            0: "TV speakers",
+            1: "ARC",
+        }.get(data.get("volume_type")),
     ),
     VidaaSensorDescription(
         key="chipplatform",

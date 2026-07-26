@@ -146,13 +146,13 @@
       "chipplatform": {
         "name": "Chipset"
       },
-      "last_state_payload": {
-        "name": "Last state response"
+      "audio_output": {
+        "name": "Audio output"
       }
     },
-    "binary_sensor": {
-      "in_use": {
-        "name": "In use"
+    "switch": {
+      "debug_logging": {
+        "name": "Debug logging"
       }
     }
   }
