@@ -21,9 +21,11 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.switch import SwitchEntity
+from homeassistant.const import STATE_ON
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 
 from .entity import VidaaTVEntity
 
@@ -31,6 +33,8 @@ if TYPE_CHECKING:
     from . import VidaaTVConfigEntry
 
 PARALLEL_UPDATES = 0
+
+_LOGGER = logging.getLogger(__name__)
 
 # Both the integration's own logger and the underlying library. pyvidaa logs the
 # MQTT/auth layer, which is where connection and credential problems show up.
@@ -48,7 +52,7 @@ async def async_setup_entry(
     )
 
 
-class VidaaTVDebugLoggingSwitch(VidaaTVEntity, SwitchEntity):
+class VidaaTVDebugLoggingSwitch(VidaaTVEntity, SwitchEntity, RestoreEntity):
     """Turns verbose logging on for the integration and pyvidaa."""
 
     _attr_name = "Debug logging"
@@ -65,6 +69,27 @@ class VidaaTVDebugLoggingSwitch(VidaaTVEntity, SwitchEntity):
         # Remember the levels so turning the switch off restores whatever the
         # user's own logging configuration had set, rather than forcing a value.
         self._previous_levels: dict[str, int] = {}
+
+    async def async_added_to_hass(self) -> None:
+        """Re-apply the setting after a restart.
+
+        Debug logging is most useful for problems that happen during startup, so
+        losing it on every reboot defeated the point. RestoreEntity gives us the
+        previous state without writing to the config entry - which would trigger
+        the update listener and reload the integration on every toggle.
+        """
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state is not None and last_state.state == STATE_ON:
+            self._apply(True)
+            self._attr_is_on = True
+            _LOGGER.debug("Debug logging restored to on after restart")
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Restore logger levels if the entity goes away."""
+        if self._attr_is_on:
+            self._apply(False)
+        await super().async_will_remove_from_hass()
 
     @property
     def available(self) -> bool:
@@ -91,13 +116,11 @@ class VidaaTVDebugLoggingSwitch(VidaaTVEntity, SwitchEntity):
         self._apply(True)
         self._attr_is_on = True
         self.async_write_ha_state()
-        logging.getLogger(DEBUG_LOGGERS[0]).debug(
-            "Debug logging enabled via switch (integration + pyvidaa)"
-        )
+        _LOGGER.debug("Debug logging enabled via switch (integration + pyvidaa)")
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Restore the previous logging levels."""
-        logging.getLogger(DEBUG_LOGGERS[0]).debug("Debug logging disabled via switch")
+        _LOGGER.debug("Debug logging disabled via switch")
         self._apply(False)
         self._attr_is_on = False
         self.async_write_ha_state()
