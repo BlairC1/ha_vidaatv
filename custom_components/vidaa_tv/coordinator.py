@@ -87,10 +87,6 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._volume_task = None              # in-flight ARC volume stepping task
         self._volume_target: int | None = None
         # ARC volume instrumentation (see VOLDBG lines in the debug log)
-        # Toggled by the 'Debug logging' switch: promotes this integration's
-        # verbose lines from DEBUG to INFO so they appear in the HA log
-        # without editing configuration.yaml.
-        self.debug_logging = False
         self._vol_debug = True
         self._press_count = 0
         self._last_press_ts: float = 0.0
@@ -128,15 +124,14 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
 
     def vlog(self, msg: str, *args) -> None:
-        """Log a verbose line, at INFO when the debug switch is on.
+        """Log a verbose line.
 
-        Home Assistant hides DEBUG unless the logger is configured, so the switch
-        promotes these to INFO rather than requiring a YAML change and restart.
+        Kept as a named helper for the noisier per-poll lines. Visibility is
+        controlled by the 'Debug logging' switch, which sets this integration's
+        (and pyvidaa's) logger level - so every debug line is surfaced, not just
+        the ones routed through here.
         """
-        if self.debug_logging:
-            _LOGGER.info(msg, *args)
-        else:
-            _LOGGER.debug(msg, *args)
+        _LOGGER.debug(msg, *args)
 
     @property
     def available(self) -> bool:
