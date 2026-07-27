@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import voluptuous as vol
 
 import logging
@@ -171,7 +172,6 @@ class VidaaTVRemote(VidaaTVEntity, RemoteEntity):
                 await self.coordinator.async_send_key(key)
 
                 if delay_secs > 0:
-                    import asyncio
                     await asyncio.sleep(delay_secs)
 
     async def async_learn_command(self, **kwargs: Any) -> None:
