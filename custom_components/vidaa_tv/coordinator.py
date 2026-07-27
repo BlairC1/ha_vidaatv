@@ -100,6 +100,8 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._hw_mac: str | None = entry.data.get(CONF_HW_MAC)
         self._tv_info: dict[str, Any] = {}    # last gettvinfo payload
         self._poll_count = 0                  # drives the app-list refresh cadence
+        self._settle_polls = 0                # fast polls remaining after power-on
+        self._last_seen_on: bool | None = None  # for off->on edge detection
         self._apps_cache: list[dict] = []    # full app list from last good fetch
         # Live-TV channel info, captured from the transient `livetv` broadcast.
         # The TV emits livetv then immediately sourceswitch/app, so the cached
@@ -112,8 +114,12 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.device_data: dict[str, Any] = {}
 
     def _set_poll_cadence(self, *, tv_on: bool) -> None:
-        """Poll quickly while the TV is off so a power-on is noticed promptly."""
-        wanted = self._on_interval if tv_on else self._OFF_SCAN_INTERVAL
+        """Poll quickly while the TV is off, and briefly after it comes on."""
+        if tv_on and self._settle_polls > 0:
+            self._settle_polls -= 1
+            wanted = self._OFF_SCAN_INTERVAL
+        else:
+            wanted = self._on_interval if tv_on else self._OFF_SCAN_INTERVAL
         if self.update_interval != wanted:
             self.update_interval = wanted
             self.vlog(
@@ -260,6 +266,14 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # revert to the configured interval, since a real poll is comparatively
     # expensive (~0.5s of queries).
     _OFF_SCAN_INTERVAL = timedelta(seconds=8)
+
+    # After the TV comes on, keep polling quickly for a few cycles. The first
+    # poll gets the source (a live query), but volume only arrives via the
+    # broadcast that our getvolume call TRIGGERS - it lands a moment after the
+    # data dict was built, so it would otherwise not show until the next slow
+    # poll. Channel info behaves the same way. A short fast window lets these
+    # settle in seconds rather than up to a full interval.
+    _SETTLE_POLLS = 3
 
     _VOLUME_ACK_TIMEOUT = 2.0    # how long to wait for a press to be acknowledged
     _VOLUME_STALL_LIMIT = 3      # consecutive unacknowledged presses before giving up
@@ -608,7 +622,14 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     )
             # --- end power state ----------------------------------------------
 
-            # Fast cadence while off, normal cadence once on.
+            # Arm a short fast-poll window when the TV has just come on, so the
+            # volume/channel broadcasts that follow the first poll are picked up
+            # promptly instead of waiting a full interval.
+            if is_on and self._last_seen_on is False:
+                self._settle_polls = self._SETTLE_POLLS
+                self.vlog("TV powered on; %s fast settle polls", self._SETTLE_POLLS)
+            self._last_seen_on = bool(is_on)
+
             self._set_poll_cadence(tv_on=bool(is_on))
 
             # Volume and mute come from the MQTT broadcast hook, not a query.
