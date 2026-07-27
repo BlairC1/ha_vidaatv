@@ -18,6 +18,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from pyvidaa import APPS
 from pyvidaa.wol import wake_tv
+from pyvidaa.topics import TOPIC_SET_SOURCE, get_topic
 from .const import (
     CONF_DEVICE_ID,
     DEFAULT_PORT,
@@ -30,6 +31,17 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+async def _try(coro):
+    """Await a query, returning the exception rather than raising.
+
+    Queries are best-effort: one failing must not abort the whole poll.
+    """
+    try:
+        return await coro
+    except Exception as err:  # noqa: BLE001 - result is inspected by the caller
+        return err
 
 
 def _ipv4_broadcast_subnet(host: str) -> str | None:
@@ -86,10 +98,6 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_is_on: bool | None = None  # last authoritative power state
         self._volume_task = None              # in-flight ARC volume stepping task
         self._volume_target: int | None = None
-        # ARC volume instrumentation (see VOLDBG lines in the debug log)
-        self._vol_debug = True
-        self._press_count = 0
-        self._last_press_ts: float = 0.0
         self._source_cache: list[dict] = []  # full sourcelist from last good poll
         # Seed from the persisted value so WoL works even if the TV has been
         # in deep standby since before Home Assistant started.
@@ -98,6 +106,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._poll_count = 0                  # drives the app-list refresh cadence
         self._settle_polls = 0                # fast polls remaining after power-on
         self._last_seen_on: bool | None = None  # for off->on edge detection
+        self._last_token_check: float | None = None  # throttles the saved-token check
         self._apps_cache: list[dict] = []    # full app list from last good fetch
         # Live-TV channel info, captured from the transient `livetv` broadcast.
         # The TV emits livetv then immediately sourceswitch/app, so the cached
@@ -210,10 +219,15 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             # Persist it: this is the only time we can learn it (the TV must be
             # reachable), but WoL needs it precisely when the TV is not.
-            self.hass.config_entries.async_update_entry(
-                self.entry,
-                data={**self.entry.data, CONF_HW_MAC: preferred},
-            )
+            # Guarded: saving the MAC is an optimisation, and must never be able
+            # to fail the whole refresh.
+            try:
+                self.hass.config_entries.async_update_entry(
+                    self.entry,
+                    data={**self.entry.data, CONF_HW_MAC: preferred},
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("Could not persist WoL MAC: %s", err)
         self._device_info_fetched = True
         _LOGGER.debug("Cached device info: %s", self.device_data)
 
@@ -277,6 +291,11 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # Refresh the access token when it has less than this until expiry.
     _TOKEN_REFRESH_THRESHOLD = 24 * 60 * 60  # 1 day
 
+    # The access token lasts ~7 days and we act 1 day before expiry, so reading
+    # the saved-token file every poll was ~2880x more often than useful. Check
+    # hourly instead.
+    _TOKEN_CHECK_INTERVAL = 60 * 60
+
     async def _async_maybe_refresh_token(self) -> None:
         """Proactively refresh the access token while connected.
 
@@ -285,6 +304,14 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         reload. A successful refresh persists a new token, so the expiry check
         stops firing afterwards.
         """
+        now = time.monotonic()
+        if (
+            self._last_token_check is not None
+            and now - self._last_token_check < self._TOKEN_CHECK_INTERVAL
+        ):
+            return
+        self._last_token_check = now
+
         try:
             status = await self.tv.async_token_status()
             if not status.get("has_token") or status.get("needs_reauth"):
@@ -339,15 +366,6 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     vval = int(payload.get("volume_value", 0))
                     now = time.monotonic()
                     if vtype in (0, 1):
-                        # Instrumentation for ARC volume tuning: how long after a
-                        # key press does the TV actually report the new level?
-                        if self._vol_debug and self._last_press_ts:
-                            _LOGGER.debug(
-                                "VOLDBG broadcast type=%s value=%s (%.0f ms after "
-                                "press #%s, live was %s)",
-                                vtype, vval, (now - self._last_press_ts) * 1000,
-                                self._press_count, self._live_volume,
-                            )
                         self._live_volume = vval
                         self._live_volume_type = vtype
                     elif vtype == 2:
@@ -505,13 +523,6 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 or self._poll_count % self._APP_REFRESH_EVERY == 0
             )
             query_start = time.monotonic()
-
-            async def _try(coro):
-                """Await a query, returning the exception rather than raising."""
-                try:
-                    return await coro
-                except Exception as err:  # noqa: BLE001
-                    return err
 
             sources_res = await _try(self.tv.async_get_sources(timeout=6))
             tv_info_res = await _try(self.tv.async_get_tv_info(timeout=5))
@@ -810,9 +821,9 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         started = time.monotonic()
         start_volume = self._live_volume
-        self._press_count = 0
+        presses = 0
         _LOGGER.debug(
-            "VOLDBG start: live=%s target=%s (one confirmed press at a time)",
+            "Volume stepping start: live=%s target=%s (one confirmed press at a time)",
             start_volume, self._volume_target,
         )
 
@@ -821,30 +832,23 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         ack_timeout = self._VOLUME_ACK_TIMEOUT
         stalled = 0
 
-        while self._press_count < self._MAX_VOLUME_STEPS:
+        while presses < self._MAX_VOLUME_STEPS:
             target = self._volume_target
             current = self._live_volume
             if target is None or current is None:
-                _LOGGER.debug("VOLDBG abort: target=%s live=%s", target, current)
                 break
 
             delta = target - int(current)
             if delta == 0:
                 _LOGGER.debug(
-                    "VOLDBG reached target %s after %s presses in %.2fs",
-                    target, self._press_count, time.monotonic() - started,
+                    "Volume reached target %s after %s presses in %.2fs",
+                    target, presses, time.monotonic() - started,
                 )
                 break
 
             step = self.tv.async_volume_up if delta > 0 else self.tv.async_volume_down
-            self._press_count += 1
-            self._last_press_ts = time.monotonic()
+            presses += 1
             before = current
-            _LOGGER.debug(
-                "VOLDBG press #%s %s: live=%s target=%s delta=%s",
-                self._press_count, "up" if delta > 0 else "down",
-                before, target, delta,
-            )
             await step()
 
             # Wait for the acknowledging broadcast rather than sleeping blindly.
@@ -857,24 +861,24 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if self._live_volume == before:
                 stalled += 1
                 _LOGGER.debug(
-                    "VOLDBG no ack within %.1fs (stall %s/%s), live still %s",
+                    "Volume no ack within %.1fs (stall %s/%s), live still %s",
                     ack_timeout, stalled, self._VOLUME_STALL_LIMIT, before,
                 )
                 if stalled >= self._VOLUME_STALL_LIMIT:
                     _LOGGER.debug(
-                        "VOLDBG giving up: volume not responding (at min/max?)"
+                        "Volume giving up: volume not responding (at min/max?)"
                     )
                     break
             else:
                 stalled = 0
         else:
-            _LOGGER.debug("VOLDBG hit MAX_VOLUME_STEPS guard (%s)",
+            _LOGGER.debug("Volume hit MAX_VOLUME_STEPS guard (%s)",
                           self._MAX_VOLUME_STEPS)
 
         _LOGGER.debug(
-            "VOLDBG end: start=%s target=%s final=%s presses=%s elapsed=%.2fs",
+            "Volume end: start=%s target=%s final=%s presses=%s elapsed=%.2fs",
             start_volume, self._volume_target, self._live_volume,
-            self._press_count, time.monotonic() - started,
+            presses, time.monotonic() - started,
         )
         await self.async_request_refresh()
 
@@ -889,8 +893,6 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         fall back to pyvidaa's mapping if that is not possible.
         """
         try:
-            from pyvidaa.topics import TOPIC_SET_SOURCE, get_topic
-
             def _publish_raw() -> bool:
                 client = getattr(self.tv, "_client", None)   # sync VidaaTV
                 if client is None or not hasattr(client, "_publish"):
