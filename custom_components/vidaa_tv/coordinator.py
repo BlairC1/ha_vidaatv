@@ -107,6 +107,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._settle_polls = 0                # fast polls remaining after power-on
         self._last_seen_on: bool | None = None  # for off->on edge detection
         self._last_token_check: float | None = None  # throttles the saved-token check
+        self._state_direct_seen = False        # does this TV answer on data/state?
         self._apps_cache: list[dict] = []    # full app list from last good fetch
         # Live-TV channel info, captured from the transient `livetv` broadcast.
         # The TV emits livetv then immediately sourceswitch/app, so the cached
@@ -131,6 +132,22 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "Poll interval -> %ss (TV %s)",
                 int(wanted.total_seconds()), "on" if tv_on else "off",
             )
+
+    def _request_refresh_threadsafe(self) -> None:
+        """Ask for a refresh from the MQTT callback thread.
+
+        The broadcast hook runs on paho's network thread, so it must not touch
+        the event loop directly.
+        """
+        hass = getattr(self, "hass", None)
+        if hass is None:
+            return
+        try:
+            hass.loop.call_soon_threadsafe(
+                lambda: hass.async_create_task(self.async_request_refresh())
+            )
+        except Exception as err:  # noqa: BLE001 - never break the callback
+            _LOGGER.debug("Could not request refresh from callback: %s", err)
 
     def vlog(self, msg: str, *args) -> None:
         """Log a verbose line.
@@ -371,6 +388,31 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     elif vtype == 2:
                         self._live_muted = bool(vval)
                     self._live_volume_ts = now
+                elif msg.topic.endswith("/platform_service/actions/tvsleep"):
+                    # pyvidaa 2.3.0: the TV announces standby the instant it
+                    # powers off, INCLUDING when switched off by its own remote.
+                    # Event-driven, so we learn immediately rather than waiting
+                    # for the next poll. The library also synthesises a
+                    # fake_sleep_0 state from this, so is_on follows on refresh.
+                    _LOGGER.debug("TV announced standby (tvsleep); refreshing")
+                    self._request_refresh_threadsafe()
+
+                elif "/ui_service/data/state" in msg.topic:
+                    # pyvidaa 2.3.0 subscribes to a PER-CLIENT state reply topic.
+                    # Some firmware answers gettvstate here instead of
+                    # re-broadcasting it. Ours has never done so - hence the live
+                    # sourcelist/gettvinfo queries this integration relies on - but
+                    # log it loudly if a TV ever does, because gettvstate would
+                    # then be a real query and much of that could be simplified.
+                    if not self._state_direct_seen:
+                        self._state_direct_seen = True
+                        _LOGGER.warning(
+                            "STATE_DIRECT supported: this TV answered gettvstate "
+                            "on its per-client topic (%s) -> %s",
+                            msg.topic,
+                            msg.payload.decode("utf-8", "replace")[:200],
+                        )
+
                 elif "ui_service/state" in msg.topic:
                     payload = json.loads(msg.payload.decode("utf-8", "replace"))
                     st = payload.get("statetype")
@@ -496,6 +538,14 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # returned this same cached dict, which the broadcast handler keeps
             # up to date. Reading the property is free and identical.
             state = self.tv.state or {}
+            # State replies are QoS 0, so a lost message would otherwise blank
+            # the channel/app info for a cycle. (Power state does not depend on
+            # this - it comes from the live gettvinfo query below.) Upstream's
+            # fix, worth adopting.
+            if not state:
+                state = await _try(self.tv.async_get_state(timeout=1)) or {}
+                if isinstance(state, Exception):
+                    state = {}
 
             # --- live source query (sourcelist answers; gettvstate does not) ----
             # Verified: get_sources() replies in ~0.5s on
