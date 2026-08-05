@@ -110,6 +110,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_seen_on: bool | None = None  # for off->on edge detection
         self._last_token_check: float | None = None  # throttles the saved-token check
         self._state_direct_seen = False        # does this TV answer on data/state?
+        self._last_push_refresh = 0.0          # debounces push-driven refreshes
         self._apps_cache: list[dict] = []    # full app list from last good fetch
         # Live-TV channel info, captured from the transient `livetv` broadcast.
         # The TV emits livetv then immediately sourceswitch/app, so the cached
@@ -136,14 +137,20 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
 
     def _request_refresh_threadsafe(self) -> None:
-        """Ask for a refresh from the MQTT callback thread.
+        """Ask for a refresh from an MQTT/executor callback thread.
 
-        The broadcast hook runs on paho's network thread, so it must not touch
-        the event loop directly.
+        Those callbacks run off the event loop, so the request must be handed
+        back to it. Debounced: a single user action (changing channel, say)
+        produces a burst of broadcasts, and each one must not trigger its own
+        full poll.
         """
         hass = getattr(self, "hass", None)
         if hass is None:
             return
+        now = time.monotonic()
+        if now - self._last_push_refresh < self._PUSH_REFRESH_DEBOUNCE:
+            return
+        self._last_push_refresh = now
         try:
             hass.loop.call_soon_threadsafe(
                 lambda: hass.async_create_task(self.async_request_refresh())
@@ -300,6 +307,10 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # Reachability probe: a refused connection fails in ms. A TV that black-holes
     # instead runs to this timeout, so keep it short - a TV that is actually awake
     # answers on the LAN in milliseconds.
+    # A single user action produces several broadcasts in quick succession, so
+    # collapse them into one refresh.
+    _PUSH_REFRESH_DEBOUNCE = 2.0
+
     _PROBE_TIMEOUT = 0.5
 
     # While the TV is off we only run the cheap probe, so we can afford to check
@@ -367,6 +378,48 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     _LOGGER.debug("Proactive token refresh failed")
         except Exception as err:
             _LOGGER.debug("Token refresh check failed: %s", err)
+
+    def _attach_library_callbacks(self) -> None:
+        """Register pyvidaa's own state/auth callbacks.
+
+        These are a supported API (unlike the paho tee below, which exists only
+        to capture what pyvidaa discards) and they fire the INSTANT the TV
+        broadcasts, so source/app/channel changes no longer wait for the next
+        poll - which is what makes this integration genuinely local_push.
+
+        They are written into _init_kwargs rather than onto the live client:
+        AsyncVidaaTV rebuilds its sync client from those kwargs after every
+        async_reset(), so this survives reconnects without re-registering.
+        """
+        kwargs = getattr(self.tv, "_init_kwargs", None)
+        if kwargs is None:
+            return
+        if kwargs.get("on_state_change") is None:
+            kwargs["on_state_change"] = self._on_state_pushed
+        if kwargs.get("on_auth_required") is None:
+            kwargs["on_auth_required"] = self._on_auth_required
+        # Apply to an already-built client too, so the first connect benefits.
+        client = getattr(self.tv, "_client", None)
+        if client is not None:
+            if getattr(client, "on_state_change", None) is None:
+                client.on_state_change = self._on_state_pushed
+            if getattr(client, "on_auth_required", None) is None:
+                client.on_auth_required = self._on_auth_required
+
+    def _on_state_pushed(self, state: dict) -> None:
+        """The TV announced a state change - refresh immediately.
+
+        Runs on pyvidaa's executor thread, so hand back to the event loop.
+        """
+        _LOGGER.debug("State pushed by TV: %s", (state or {}).get("statetype"))
+        self._request_refresh_threadsafe()
+
+    def _on_auth_required(self) -> None:
+        """The TV is asking to be paired again."""
+        _LOGGER.warning(
+            "TV is requesting pairing again; the integration will need "
+            "re-authenticating"
+        )
 
     def _attach_volume_listener(self) -> None:
         """Tee the MQTT callback to capture volume broadcasts pyvidaa discards.
@@ -572,6 +625,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             # Capture volume broadcasts pyvidaa ignores (re-attaches after reconnects).
             try:
+                self._attach_library_callbacks()
                 self._attach_volume_listener()
             except Exception as err:  # noqa: BLE001 - must never fail the refresh
                 _LOGGER.debug("Could not attach volume listener: %s", err)
