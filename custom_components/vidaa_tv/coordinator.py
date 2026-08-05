@@ -83,6 +83,8 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._on_interval = timedelta(seconds=scan_interval)
         self._available = True
         self._device_info_fetched = False
+        self._device_info_misses = 0
+        self._device_info_unsupported = False
         self._auth_failures = 0
         # Volume/mute captured directly from MQTT broadcasts (see
         # _attach_volume_listener); pyvidaa drops the ARC/external-amp type.
@@ -173,7 +175,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         no after-the-fact device-registry surgery is required (that race is why
         model/firmware previously never showed up).
         """
-        if self._device_info_fetched:
+        if self._device_info_fetched or self._device_info_unsupported:
             return
 
         try:
@@ -184,8 +186,18 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         if not info:
             # Leave the flag unset so we retry on a later refresh (e.g. the TV
-            # was off during setup and comes online afterwards).
-            _LOGGER.debug("No device info returned from TV yet")
+            # was off during setup and comes online afterwards) - but give up
+            # after a few misses so firmware that never answers is not polled
+            # forever. A reconnect clears the latch.
+            self._device_info_misses += 1
+            if self._device_info_misses >= self._MAX_DEVICE_INFO_MISSES:
+                self._device_info_unsupported = True
+                _LOGGER.debug(
+                    "No device info after %s attempts; not asking again until "
+                    "the TV reconnects", self._device_info_misses,
+                )
+            else:
+                _LOGGER.debug("No device info returned from TV yet")
             return
 
         self.device_data = {
@@ -269,6 +281,10 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     # applist is near-static (it only changes when apps are installed/removed),
     # so refresh it every N polls rather than on every cycle.
+    # Consecutive empty getdeviceinfo replies before we stop asking until the
+    # next reconnect. Some firmware never answers; retrying forever is waste.
+    _MAX_DEVICE_INFO_MISSES = 3
+
     _APP_REFRESH_EVERY = 20
 
     # Safety cap on emulated volume stepping (see async_set_volume).
@@ -332,6 +348,11 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             status = await self.tv.async_token_status()
             if not status.get("has_token") or status.get("needs_reauth"):
+                return
+            if status.get("tokenless"):
+                # Older firmware issues no token at all - it authorizes the
+                # client_id when the PIN is entered. There is nothing to renew,
+                # and its zero expiry would otherwise look permanently overdue.
                 return
             near_expiry = (
                 status.get("access_valid")
@@ -468,6 +489,36 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             pass
         return True
 
+    def _powered_off_data(self) -> dict[str, Any]:
+        """The reading for a TV that is off, as opposed to an update failure.
+
+        A TV in standby takes its MQTT broker down with it, so being unreachable
+        is a power state - not a fetch failure. Raising UpdateFailed here logged
+        an ERROR with a traceback on every poll while the TV was off, and left
+        the entities *unavailable* rather than *off*, which is both wrong and
+        worse for history and automations. (Credit: warrenrees/ha_vidaatv.)
+
+        The source/app caches are kept: they describe the TV, not its power
+        state, so the dropdowns stay populated while it is off.
+        """
+        return {
+            "is_on": False,
+            "state": None,
+            "statetype": None,
+            "volume": None,
+            "is_muted": False,
+            "app": None,
+            "source": None,
+            "source_detail": None,
+            "volume_type": self._live_volume_type,
+            "sources": list(self._source_cache),
+            "tv_info": dict(self._tv_info),
+            "apps": list(self._apps_cache),
+            "channel_name": None,
+            "channel_num": None,
+            "program": None,
+        }
+
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from TV."""
         start = time.monotonic()
@@ -480,13 +531,14 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # is noticed immediately.
                 probe_start = time.monotonic()
                 if not await self._async_is_reachable():
-                    self._available = False
+                    self._available = True
+                    self._last_is_on = False
                     self._set_poll_cadence(tv_on=False)
                     _LOGGER.debug(
-                        "TV unreachable (probe %.0f ms); skipping connect",
+                        "TV unreachable (probe %.0f ms); reporting it as off",
                         (time.monotonic() - probe_start) * 1000,
                     )
-                    raise UpdateFailed("TV is not reachable (probably off)")
+                    return self._powered_off_data()
                 _LOGGER.debug(
                     "TV reachable (probe %.0f ms), reconnecting",
                     (time.monotonic() - probe_start) * 1000,
@@ -501,12 +553,20 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # Try to connect with longer timeout for wake-up scenarios
                 connected = await self.tv.async_connect(timeout=5)
                 if not connected:
-                    self._available = False
-                    raise UpdateFailed("Failed to connect to TV")
+                    # Reachable but refusing the handshake: still a power state
+                    # rather than an error (see _powered_off_data).
+                    self._available = True
+                    self._last_is_on = False
+                    self._set_poll_cadence(tv_on=False)
+                    _LOGGER.debug("Could not connect; reporting the TV as off")
+                    return self._powered_off_data()
                 _LOGGER.debug("Reconnect took %.2fs", time.monotonic() - start)
                 # A reconnect can mean the TV rebooted (e.g. a firmware update),
-                # so re-fetch device info to pick up a new firmware version.
+                # so re-fetch device info to pick up a new firmware version -
+                # including on a TV we had given up asking.
                 self._device_info_fetched = False
+                self._device_info_misses = 0
+                self._device_info_unsupported = False
 
             self._available = True
 
