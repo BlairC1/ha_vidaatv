@@ -35,6 +35,36 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 
+PARALLEL_UPDATES = 1
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: VidaaTVConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Set up Hisense TV remote from a config entry."""
+    coordinator = entry.runtime_data.coordinator
+    async_add_entities([VidaaTVRemote(coordinator, entry)])
+
+    # Registered as ENTITY services so Home Assistant resolves the target for
+    # us. Previously these were plain domain services whose schema rejected
+    # `entity_id`, so every targeted call failed validation before reaching the
+    # integration - and the handler ignored the target anyway, firing at every
+    # configured TV at once.
+    platform = entity_platform.async_get_current_platform()
+    platform.async_register_entity_service(
+        SERVICE_SEND_KEY,
+        {vol.Required(ATTR_KEY): cv.string},
+        "async_send_key_service",
+    )
+    platform.async_register_entity_service(
+        SERVICE_LAUNCH_APP,
+        {vol.Required(ATTR_APP): cv.string},
+        "async_launch_app_service",
+    )
+
+
 class VidaaTVRemote(VidaaTVEntity, RemoteEntity):
     """Representation of a Hisense TV remote."""
 
