@@ -59,5 +59,4 @@ PLATFORMS: Final = [
     "remote",
     "sensor",
     "switch",
-    "button",
 ]
