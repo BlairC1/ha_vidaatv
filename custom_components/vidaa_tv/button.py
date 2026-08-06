@@ -1,20 +1,25 @@
 """Button platform for Hisense TV.
 
-Exposes the handful of remote keys that are genuinely useful as one-tap
-dashboard buttons or automation targets. The full key set stays available via
-the ``vidaa_tv.send_key`` service and the remote entity; duplicating all 60+
-keys as entities would just clutter the registry.
+Just one button: Audio only.
 
-Only Home, Back and Menu are enabled by default - the rest are registered but
-disabled so they can be turned on individually without cluttering new installs.
+It is a button rather than a switch deliberately. ``ONLY_AUDIO`` toggles the
+panel, but the TV does not expose the panel's state anywhere - verified by
+diffing every field of all five queryable actions (gettvinfo, getdeviceinfo,
+capability, sourcelist, state) with the picture on and off, which showed no
+difference at all, and by watching the broadcast topics while toggling, which
+produced nothing. A switch would therefore have to guess, and would silently
+desync the moment anyone used the physical remote. A button claims no state and
+is honest about what it does.
+
+Note the key name breaks the usual convention: it is ``ONLY_AUDIO``, with no
+``KEY_`` prefix. None of the published VIDAA key lists include it.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from homeassistant.components.button import ButtonEntity, ButtonEntityDescription
+from homeassistant.components.button import ButtonEntity
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -25,60 +30,8 @@ if TYPE_CHECKING:
 
 PARALLEL_UPDATES = 1
 
-
-@dataclass(frozen=True, kw_only=True)
-class VidaaButtonDescription(ButtonEntityDescription):
-    """Describes a Hisense TV key button."""
-
-    key_code: str
-
-
-BUTTONS: tuple[VidaaButtonDescription, ...] = (
-    VidaaButtonDescription(
-        key="home", name="Home", icon="mdi:home", key_code="KEY_HOME"
-    ),
-    VidaaButtonDescription(
-        key="back", name="Back", icon="mdi:arrow-left", key_code="KEY_BACK"
-    ),
-    VidaaButtonDescription(
-        key="menu", name="Menu", icon="mdi:menu", key_code="KEY_MENU"
-    ),
-    VidaaButtonDescription(
-        key="exit",
-        name="Exit",
-        icon="mdi:exit-to-app",
-        key_code="KEY_EXIT",
-        entity_registry_enabled_default=False,
-    ),
-    VidaaButtonDescription(
-        key="info",
-        name="Info",
-        icon="mdi:information-outline",
-        key_code="KEY_INFO",
-        entity_registry_enabled_default=False,
-    ),
-    VidaaButtonDescription(
-        key="subtitle",
-        name="Subtitles",
-        icon="mdi:subtitles-outline",
-        key_code="KEY_SUBTITLE",
-        entity_registry_enabled_default=False,
-    ),
-    VidaaButtonDescription(
-        key="channel_up",
-        name="Channel up",
-        icon="mdi:arrow-up-bold",
-        key_code="KEY_CHANNELUP",
-        entity_registry_enabled_default=False,
-    ),
-    VidaaButtonDescription(
-        key="channel_down",
-        name="Channel down",
-        icon="mdi:arrow-down-bold",
-        key_code="KEY_CHANNELDOWN",
-        entity_registry_enabled_default=False,
-    ),
-)
+# Toggles the panel off/on while audio keeps playing. Not KEY_ prefixed.
+AUDIO_ONLY_KEY = "ONLY_AUDIO"
 
 
 async def async_setup_entry(
@@ -87,24 +40,22 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the Hisense TV buttons."""
-    coordinator = entry.runtime_data.coordinator
-    async_add_entities(
-        VidaaTVButton(coordinator, entry, description) for description in BUTTONS
-    )
+    async_add_entities([VidaaTVAudioOnlyButton(entry.runtime_data.coordinator, entry)])
 
 
-class VidaaTVButton(VidaaTVEntity, ButtonEntity):
-    """Sends a single remote key."""
+class VidaaTVAudioOnlyButton(VidaaTVEntity, ButtonEntity):
+    """Toggles audio-only mode (screen off, sound on)."""
 
-    entity_description: VidaaButtonDescription
+    _attr_name = "Audio only"
+    _attr_translation_key = "audio_only"
+    _attr_icon = "mdi:television-off"
 
-    def __init__(self, coordinator, entry, description: VidaaButtonDescription) -> None:
+    def __init__(self, coordinator, entry) -> None:
         """Initialise the button."""
         super().__init__(coordinator, entry)
-        self.entity_description = description
         base = self._device_id or entry.entry_id
-        self._attr_unique_id = f"{base}_button_{description.key}"
+        self._attr_unique_id = f"{base}_audio_only"
 
     async def async_press(self) -> None:
-        """Send the key to the TV."""
-        await self.coordinator.async_send_key(self.entity_description.key_code)
+        """Toggle the panel."""
+        await self.coordinator.async_send_key(AUDIO_ONLY_KEY)
