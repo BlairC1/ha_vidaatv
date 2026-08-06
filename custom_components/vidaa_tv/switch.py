@@ -17,6 +17,7 @@ levels, so it inherits whatever the rest of your logging config specifies.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -34,6 +35,15 @@ if TYPE_CHECKING:
 
 PARALLEL_UPDATES = 0
 
+# Toggles audio-only mode (panel off, sound on). Not in any published key list.
+AUDIO_ONLY_KEY = "KEY_AUDIO"
+# Any key press wakes the panel. KEY_INFO is used because it is harmless: it
+# shows a brief overlay that dismisses itself, unlike navigation keys which
+# could select or exit something in an app.
+WAKE_KEY = "KEY_INFO"
+# Gap between the wake and the toggle, so the TV processes them in order.
+KEY_GAP = 0.6
+
 _LOGGER = logging.getLogger(__name__)
 
 # Both the integration's own logger and the underlying library. pyvidaa logs the
@@ -47,9 +57,79 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the Hisense TV switches."""
+    coordinator = entry.runtime_data.coordinator
     async_add_entities(
-        [VidaaTVDebugLoggingSwitch(entry.runtime_data.coordinator, entry)]
+        [
+            VidaaTVDebugLoggingSwitch(coordinator, entry),
+            VidaaTVAudioOnlySwitch(coordinator, entry),
+        ]
     )
+
+
+class VidaaTVAudioOnlySwitch(VidaaTVEntity, SwitchEntity, RestoreEntity):
+    """Audio-only mode: panel off, sound still playing.
+
+    KEY_AUDIO only TOGGLES the panel, and the TV exposes its panel state
+    nowhere - verified by diffing every field of all five queryable actions with
+    the picture on and off (no difference) and by watching the broadcast topics
+    while toggling (nothing). A switch driven by a bare toggle would therefore
+    drift out of sync the moment its assumed state was wrong.
+
+    The fix is to make both operations idempotent by exploiting the fact that
+    ANY key press wakes the panel:
+
+        turn on  -> wake key, then KEY_AUDIO   => panel off, whatever the start
+        turn off -> wake key                   => panel on,  whatever the start
+
+    Neither depends on knowing the current state, so a stale assumption
+    self-corrects on the next command. The reported state is still optimistic -
+    a press on the physical remote cannot be seen - but it can only be wrong
+    until the next time the switch is used.
+    """
+
+    _attr_name = "Audio only"
+    _attr_translation_key = "audio_only"
+    _attr_icon = "mdi:television-off"
+
+    def __init__(self, coordinator, entry) -> None:
+        """Initialise the switch."""
+        super().__init__(coordinator, entry)
+        base = self._device_id or entry.entry_id
+        self._attr_unique_id = f"{base}_audio_only"
+        self._attr_is_on = False
+
+    async def async_added_to_hass(self) -> None:
+        """Restore the last known position (optimistic, see class docstring)."""
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state is not None:
+            self._attr_is_on = last_state.state == STATE_ON
+
+    @property
+    def available(self) -> bool:
+        """Only usable while the TV is on."""
+        return bool((self.coordinator.data or {}).get("is_on"))
+
+    @property
+    def is_on(self) -> bool:
+        """Return the assumed audio-only state."""
+        return self._attr_is_on
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Panel off, sound on."""
+        _LOGGER.debug("Audio only on: %s then %s", WAKE_KEY, AUDIO_ONLY_KEY)
+        await self.coordinator.async_send_key(WAKE_KEY)
+        await asyncio.sleep(KEY_GAP)
+        await self.coordinator.async_send_key(AUDIO_ONLY_KEY)
+        self._attr_is_on = True
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Panel back on - any key wakes it."""
+        _LOGGER.debug("Audio only off: %s", WAKE_KEY)
+        await self.coordinator.async_send_key(WAKE_KEY)
+        self._attr_is_on = False
+        self.async_write_ha_state()
 
 
 class VidaaTVDebugLoggingSwitch(VidaaTVEntity, SwitchEntity, RestoreEntity):
