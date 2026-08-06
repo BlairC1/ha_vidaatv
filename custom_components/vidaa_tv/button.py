@@ -11,8 +11,9 @@ produced nothing. A switch would therefore have to guess, and would silently
 desync the moment anyone used the physical remote. A button claims no state and
 is honest about what it does.
 
-Note the key name breaks the usual convention: it is ``ONLY_AUDIO``, with no
-``KEY_`` prefix. None of the published VIDAA key lists include it.
+The key is ``KEY_ONLY_AUDIO`` - conventional ``KEY_`` prefix, but note the word
+order (ONLY_AUDIO, not AUDIO_ONLY). It appears in none of the published VIDAA
+key lists, which is why it had to be found by sweeping candidates.
 """
 
 from __future__ import annotations
@@ -30,8 +31,8 @@ if TYPE_CHECKING:
 
 PARALLEL_UPDATES = 1
 
-# Toggles the panel off/on while audio keeps playing. Not KEY_ prefixed.
-AUDIO_ONLY_KEY = "ONLY_AUDIO"
+# Toggles the panel off/on while audio keeps playing.
+AUDIO_ONLY_KEY = "KEY_ONLY_AUDIO"
 
 
 async def async_setup_entry(
