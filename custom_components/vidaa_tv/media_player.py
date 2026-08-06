@@ -31,11 +31,6 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-# Activity states where the TV is showing something, as opposed to sitting on
-# the home screen or in a menu. Used to decide when to report PLAYING so the
-# frontend exposes transport controls.
-CONTENT_STATETYPES = frozenset({"sourceswitch", "livetv", "app"})
-
 PARALLEL_UPDATES = 1
 
 
@@ -67,10 +62,6 @@ class VidaaTVMediaPlayer(VidaaTVEntity, MediaPlayerEntity):
         | MediaPlayerEntityFeature.PAUSE
         | MediaPlayerEntityFeature.STOP
         | MediaPlayerEntityFeature.PLAY_MEDIA
-        # These are implemented below but were previously undeclared, so the
-        # frontend never rendered the buttons.
-        | MediaPlayerEntityFeature.NEXT_TRACK
-        | MediaPlayerEntityFeature.PREVIOUS_TRACK
         | MediaPlayerEntityFeature.BROWSE_MEDIA
     )
 
@@ -102,14 +93,13 @@ class VidaaTVMediaPlayer(VidaaTVEntity, MediaPlayerEntity):
         if not self.coordinator.data.get("is_on"):
             return MediaPlayerState.OFF
 
-        # Home Assistant only renders transport controls (skip forward/back) when
-        # the state is PLAYING or PAUSED - a plain ON gets power and volume only.
-        # This firmware never tells us whether content is actually playing, so we
-        # report PLAYING whenever the TV is showing a source/app/channel, which
-        # is what other TV integrations do to expose those controls. The launcher
-        # and settings screens stay ON, since nothing is playing there.
-        if self.coordinator.data.get("statetype") in CONTENT_STATETYPES:
-            return MediaPlayerState.PLAYING
+        # Deliberately ON, never PLAYING. This firmware does not report whether
+        # content is actually playing - only which source/app/channel is showing
+        # - so claiming PLAYING would be a guess. Some TV integrations report
+        # PLAYING anyway because Home Assistant only renders transport controls
+        # (skip forward/back) in that state, but that trades an honest state for
+        # two buttons. The transport methods below remain available as services
+        # and via the remote entity.
         return MediaPlayerState.ON
 
     @property
