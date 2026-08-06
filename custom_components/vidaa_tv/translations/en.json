@@ -153,9 +153,7 @@
     "switch": {
       "debug_logging": {
         "name": "Debug logging"
-      }
-    },
-    "button": {
+      },
       "audio_only": {
         "name": "Audio only"
       }
