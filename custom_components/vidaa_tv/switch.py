@@ -112,11 +112,28 @@ class VidaaTVAudioOnlySwitch(VidaaTVEntity, SwitchEntity, RestoreEntity):
 
     @property
     def is_on(self) -> bool:
-        """Return the assumed audio-only state."""
+        """Return the assumed audio-only state.
+
+        Forced off whenever the TV is off: audio-only cannot outlive the TV, so
+        reporting it as still active would be wrong and would make the next
+        turn_off a no-op when it should wake the panel.
+        """
+        if not (self.coordinator.data or {}).get("is_on"):
+            return False
         return self._attr_is_on
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        """Panel off, sound on."""
+        """Panel off, sound on.
+
+        Also a no-op when already on: the wake+toggle pair would briefly light
+        the panel before blanking it again, which looks like a glitch.
+        """
+        if not (self.coordinator.data or {}).get("is_on"):
+            _LOGGER.debug("TV is off; ignoring audio-only on")
+            return
+        if self._attr_is_on:
+            _LOGGER.debug("Audio only already on; nothing to send")
+            return
         _LOGGER.debug("Audio only on: %s then %s", WAKE_KEY, AUDIO_ONLY_KEY)
         await self.coordinator.async_send_key(WAKE_KEY)
         await asyncio.sleep(KEY_GAP)
@@ -125,7 +142,22 @@ class VidaaTVAudioOnlySwitch(VidaaTVEntity, SwitchEntity, RestoreEntity):
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        """Panel back on - any key wakes it."""
+        """Panel back on - any key wakes it.
+
+        No-op when we already believe the panel is on. The wake key shows a
+        brief info banner, so a caller that repeatedly sets the switch off
+        (a scene, or a voice assistant syncing state) would otherwise make the
+        banner appear at random. Skipping the redundant press costs nothing:
+        the panel is already in the requested state.
+        """
+        if not (self.coordinator.data or {}).get("is_on"):
+            # Nothing to wake, and the assumed state is meaningless while off.
+            _LOGGER.debug("TV is off; ignoring audio-only off")
+            self._attr_is_on = False
+            return
+        if not self._attr_is_on:
+            _LOGGER.debug("Audio only already off; not sending %s", WAKE_KEY)
+            return
         _LOGGER.debug("Audio only off: %s", WAKE_KEY)
         await self.coordinator.async_send_key(WAKE_KEY)
         self._attr_is_on = False
