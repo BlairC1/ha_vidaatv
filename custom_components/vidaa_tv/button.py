@@ -1,62 +1,126 @@
-"""Button platform for Hisense TV.
-
-Just one button: Audio only.
-
-It is a button rather than a switch deliberately. ``ONLY_AUDIO`` toggles the
-panel, but the TV does not expose the panel's state anywhere - verified by
-diffing every field of all five queryable actions (gettvinfo, getdeviceinfo,
-capability, sourcelist, state) with the picture on and off, which showed no
-difference at all, and by watching the broadcast topics while toggling, which
-produced nothing. A switch would therefore have to guess, and would silently
-desync the moment anyone used the physical remote. A button claims no state and
-is honest about what it does.
-
-The key is ``KEY_ONLY_AUDIO`` - conventional ``KEY_`` prefix, but note the word
-order (ONLY_AUDIO, not AUDIO_ONLY). It appears in none of the published VIDAA
-key lists, which is why it had to be found by sweeping candidates.
+#!/usr/bin/env python3
 """
+vidaa_key_probe.py - hunt for an undocumented remote key (e.g. Audio Only).
 
-from __future__ import annotations
+There is no published list of VIDAA key names: every list in the wild
+(Krazy998, hisensetv, pyvidaa) was assembled by trying names and keeping the
+ones that worked. The TV silently ignores names it does not recognise, so
+sweeping candidates is safe.
 
-from typing import TYPE_CHECKING
+Sends each candidate with a pause between them and prints any state broadcast
+that follows, so a key that changes something is visible in the output as well
+as on the screen.
 
-from homeassistant.components.button import ButtonEntity
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+WATCH THE TV while this runs - the panel blanking is the signal you want, and
+audio-only may not produce any broadcast at all.
 
-from .entity import VidaaTVEntity
+  python3 vidaa_key_probe.py --ip <IP> --cert <pem> --key <key> --mac <MAC>
+  python3 vidaa_key_probe.py ... --delay 3          # slower sweep
+  python3 vidaa_key_probe.py ... --keys KEY_A,KEY_B # test specific names
+"""
+import argparse
+import json
+import time
 
-if TYPE_CHECKING:
-    from . import VidaaTVConfigEntry
+from pyvidaa.client import VidaaTV
+from pyvidaa.protocol import AuthMethod
 
-PARALLEL_UPDATES = 1
+# Ordered by how likely they seem for a picture-off / audio-only button.
+CANDIDATES = [
+    # direct names
+    "KEY_AUDIOONLY", "KEY_AUDIO_ONLY", "KEY_AUDIOMODE", "KEY_AUDIO_MODE",
+    "KEY_ONLYAUDIO", "KEY_ONLY_AUDIO", "KEY_AUDIO",
+    # picture / screen off
+    "KEY_PICTUREOFF", "KEY_PICTURE_OFF", "KEY_PICTUREMODE", "KEY_PICTURE",
+    "KEY_SCREENOFF", "KEY_SCREEN_OFF", "KEY_SCREEN", "KEY_DISPLAYOFF",
+    "KEY_DISPLAY_OFF", "KEY_DISPLAY", "KEY_PANELOFF", "KEY_PANEL_OFF",
+    "KEY_BLANK", "KEY_BLANKSCREEN", "KEY_BLACKSCREEN", "KEY_VIDEOOFF",
+    "KEY_VIDEO_OFF", "KEY_NOPICTURE",
+    # power saving / eco, which is where some sets put it
+    "KEY_ECO", "KEY_ECOMODE", "KEY_ENERGY", "KEY_ENERGYSAVING",
+    "KEY_POWERSAVE", "KEY_POWERSAVING", "KEY_BACKLIGHT", "KEY_BACKLIGHTOFF",
+    # linux input-event style names VIDAA may reuse
+    "KEY_SWITCHVIDEOMODE", "KEY_VIDEO", "KEY_MEDIA", "KEY_SOUND",
+    "KEY_MODE", "KEY_TOGGLE_SCREEN",
+    # misc buttons that sometimes carry it
+    "KEY_GREEN", "KEY_YELLOW", "KEY_BLUE", "KEY_RED",
+    "KEY_SETTINGS", "KEY_QUICKMENU", "KEY_TOOLS", "KEY_OPTION",
+]
 
-# Toggles the panel off/on while audio keeps playing.
-AUDIO_ONLY_KEY = "KEY_ONLY_AUDIO"
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ip", required=True)
+    ap.add_argument("--cert", required=True)
+    ap.add_argument("--key", required=True)
+    ap.add_argument("--mac", required=True)
+    ap.add_argument("--delay", type=float, default=2.0,
+                    help="seconds between keys (raise to watch the screen)")
+    ap.add_argument("--keys", help="comma-separated list to test instead")
+    args = ap.parse_args()
+
+    keys = args.keys.split(",") if args.keys else CANDIDATES
+
+    tv = VidaaTV(
+        host=args.ip, certfile=args.cert, keyfile=args.key,
+        mac_address=args.mac, use_dynamic_auth=True,
+        auth_method=AuthMethod.MODERN, enable_persistence=False,
+        verify_ssl=False,
+    )
+    if not tv.connect(timeout=12):
+        raise SystemExit("connect FAILED - check --mac and the cert paths")
+    print(f"CONNECTED as {tv.client_id}\n")
+
+    seen: list[tuple[float, str]] = []
+    paho = tv._client
+    previous = paho.on_message
+
+    def hook(client, userdata, msg):
+        if "ui_service/state" in msg.topic:
+            seen.append(
+                (time.monotonic(), msg.payload.decode("utf-8", "replace")[:160])
+            )
+        if previous:
+            previous(client, userdata, msg)
+
+    paho.on_message = hook
+    paho.subscribe("#", qos=0)
+    time.sleep(2)
+
+    print(f"Sweeping {len(keys)} candidates, {args.delay}s apart.")
+    print("WATCH THE TV - a blanked panel is the result you are looking for.\n")
+
+    for name in keys:
+        name = name.strip()
+        if not name:
+            continue
+        # Print BEFORE sending. Printing afterwards meant the last line on
+        # screen named the PREVIOUS key while the current one was still in its
+        # delay - so interrupting the moment the TV reacted pointed at the wrong
+        # key entirely.
+        print(f"  sending {name:24}", end="", flush=True)
+        mark = time.monotonic()
+        seen.clear()
+        try:
+            tv.send_key(name)
+        except Exception as err:  # noqa: BLE001
+            print(f" send failed: {err}")
+            continue
+        time.sleep(args.delay)
+        reactions = [p for t, p in seen if t > mark]
+        if reactions:
+            print(" *** TV REACTED ***")
+            for payload in reactions[:2]:
+                print(f"      {payload}")
+        else:
+            print(" -")
+
+    tv.disconnect()
+    print(
+        "\nDone. A key that blanked the screen is the one you want - note that\n"
+        "it may show '-' above, since the TV does not broadcast every change."
+    )
 
 
-async def async_setup_entry(
-    hass: HomeAssistant,
-    entry: VidaaTVConfigEntry,
-    async_add_entities: AddEntitiesCallback,
-) -> None:
-    """Set up the Hisense TV buttons."""
-    async_add_entities([VidaaTVAudioOnlyButton(entry.runtime_data.coordinator, entry)])
-
-
-class VidaaTVAudioOnlyButton(VidaaTVEntity, ButtonEntity):
-    """Toggles audio-only mode (screen off, sound on)."""
-
-    _attr_name = "Audio only"
-    _attr_translation_key = "audio_only"
-    _attr_icon = "mdi:television-off"
-
-    def __init__(self, coordinator, entry) -> None:
-        """Initialise the button."""
-        super().__init__(coordinator, entry)
-        base = self._device_id or entry.entry_id
-        self._attr_unique_id = f"{base}_audio_only"
-
-    async def async_press(self) -> None:
-        """Toggle the panel."""
-        await self.coordinator.async_send_key(AUDIO_ONLY_KEY)
+if __name__ == "__main__":
+    main()
