@@ -93,13 +93,26 @@ class VidaaTVMediaPlayer(VidaaTVEntity, MediaPlayerEntity):
         if not self.coordinator.data.get("is_on"):
             return MediaPlayerState.OFF
 
-        # Deliberately ON, never PLAYING. This firmware does not report whether
-        # content is actually playing - only which source/app/channel is showing
-        # - so claiming PLAYING would be a guess. Some TV integrations report
-        # PLAYING anyway because Home Assistant only renders transport controls
-        # (skip forward/back) in that state, but that trades an honest state for
-        # two buttons. The transport methods below remain available as services
-        # and via the remote entity.
+        # Deliberately ON, never PLAYING.
+        #
+        # Verified by capturing the broadcast topics while playing a TV-native
+        # app (Plex) and live TV: neither payload carries playback data, and no
+        # broadcast is sent during playback at all - the state topic only fires
+        # on app launch and source change.
+        #
+        #     {"statetype":"app","name":"plex","url":"...","appId":"42"}
+        #     {"statetype":"livetv","channel_name":"9GemHD Melbourne",...}
+        #
+        # The playstate/curtime/totaltime fields that appear in the fake_sleep
+        # payload belong to a generic schema this firmware never populates; they
+        # are always zero. So playback state is not observable for HDMI sources,
+        # native apps or live TV, and reporting PLAYING would be a guess.
+        #
+        # Home Assistant only renders transport controls (skip forward/back)
+        # when the state is PLAYING or PAUSED, so some TV integrations report it
+        # regardless to expose those buttons. That trades an honest state for
+        # two controls. The transport methods below are still callable as
+        # services and through the remote entity.
         return MediaPlayerState.ON
 
     @property
