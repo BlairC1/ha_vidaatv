@@ -26,13 +26,42 @@ from .entity import VidaaTVEntity
 from .helpers import build_source_list, resolve_source_id
 
 # Import key utilities from the library
-from pyvidaa.keys import get_key
+from pyvidaa.keys import ALL_KEYS, KEY_NAME_MAP, get_key
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
     from . import VidaaTVConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def resolve_key(command: str) -> str:
+    """Resolve a send_command argument to the key string the TV expects.
+
+    pyvidaa's get_key() maps friendly names ("menu" -> KEY_MENU), but its final
+    fallback invents a KEY_ prefix for anything it does not recognise. That
+    breaks keys whose real name has no prefix: ONLY_AUDIO (audio-only mode, not
+    in any published key list) would be sent as KEY_ONLY_AUDIO and silently
+    ignored by the TV.
+
+    So we only use get_key() when it actually knows the name, and otherwise pass
+    the command through untouched - which is what vidaa_tv.send_key already does
+    and why that service works with ONLY_AUDIO while send_command did not.
+    """
+    name = (command or "").strip()
+    if not name:
+        return name
+
+    # A name pyvidaa genuinely knows: friendly alias, or a real KEY_ constant.
+    if name.lower() in KEY_NAME_MAP or name in ALL_KEYS:
+        return get_key(name)
+    if f"KEY_{name.upper()}" in ALL_KEYS:
+        return get_key(name)
+
+    # Unknown to the library: send exactly what the user asked for. Undocumented
+    # keys are common on this platform, and the TV ignores anything invalid.
+    _LOGGER.debug("Key %r not in pyvidaa's map; sending it unchanged", name)
+    return name
 
 PARALLEL_UPDATES = 1
 
@@ -168,7 +197,7 @@ class VidaaTVRemote(VidaaTVEntity, RemoteEntity):
         for _ in range(num_repeats):
             for cmd in command:
                 # Use the library's key mapping which supports all keys
-                key = get_key(cmd)
+                key = resolve_key(cmd)
                 await self.coordinator.async_send_key(key)
 
                 if delay_secs > 0:
