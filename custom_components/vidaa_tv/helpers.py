@@ -57,6 +57,56 @@ def _norm(value: str | None) -> str:
     return (value or "").strip().casefold()
 
 
+def build_source_aliases(
+    sources: list[dict[str, Any]] | None,
+    apps: list[dict[str, Any]] | None,
+) -> dict[str, str]:
+    """Map every name the TV might use for a source onto its list label.
+
+    The TV calls one input three different things depending on which message you
+    read - ``sourcename`` ("HDMI3"), ``displayname`` ("Onkyo AVR") and
+    ``sourceid`` ("TV") - and the state broadcast does not always use the one the
+    source list is built from. Reporting an unmatched name is not harmless:
+    consumers that cannot match it fall back to a guess, and Home Assistant's
+    HomeKit bridge in particular picks ``source_list[0]``, so the TV appears to
+    be on whichever entry happens to sort first.
+
+    Keys are lowercased; values are the exact label that appears in the list.
+    (Approach borrowed from warrenrees/ha_vidaatv v2.3.0.)
+    """
+    aliases: dict[str, str] = {}
+    for src in sources or []:
+        if not isinstance(src, dict):
+            continue
+        label = source_display_name(src)
+        if not label:
+            continue
+        for name in (
+            src.get("displayname"),
+            src.get("sourcename"),
+            src.get("sourceid"),
+            src.get("name"),
+        ):
+            if name:
+                aliases[str(name).strip().casefold()] = label
+    for app in apps or []:
+        label = app_display_name(app)
+        if label:
+            aliases[label.strip().casefold()] = label
+    return aliases
+
+
+def canonical_source(value: str | None, aliases: dict[str, str]) -> str | None:
+    """Resolve any name the TV used onto the label shown in source_list.
+
+    Unknown names pass through unchanged: a TV whose source list we never
+    retrieved is no worse off than before.
+    """
+    if not value:
+        return None
+    return aliases.get(value.strip().casefold(), value)
+
+
 def resolve_source_id(
     name: str,
     sources: list[dict[str, Any]] | None,
