@@ -19,9 +19,12 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .coordinator import VidaaTVDataUpdateCoordinator
 from .entity import VidaaTVEntity
+from .const import ACTIVITY_HOME
 from .helpers import (
     app_icon_url,
+    build_source_aliases,
     build_source_list,
+    canonical_source,
     find_app,
     resolve_source_id,
 )
@@ -189,22 +192,35 @@ class VidaaTVMediaPlayer(VidaaTVEntity, MediaPlayerEntity):
 
     @property
     def source(self) -> str | None:
-        """Return current source."""
-        if not self.coordinator.data:
+        """Current source, named as it appears in source_list.
+
+        The TV calls one input three different things - sourcename ("HDMI3"),
+        displayname ("Onkyo AVR") and sourceid ("TV") - depending on which
+        message you read. Reporting whichever the broadcast happened to use left
+        the value absent from source_list, and a consumer that cannot match it
+        falls back to a guess. Resolve it to the canonical label instead.
+        """
+        data = self.coordinator.data or {}
+        if not data or not self.coordinator.available:
             return None
-        return self.coordinator.data.get("source")
+        aliases = build_source_aliases(data.get("sources"), data.get("apps"))
+        return canonical_source(data.get("source"), aliases)
 
     @property
     def source_list(self) -> list[str] | None:
         """Inputs + apps, derived from coordinator data (no per-entity fetch).
 
-        The coordinator queries both every poll and publishes them, so there is
-        nothing to fetch or cache here - which removes the races that used to
-        make inputs or apps vanish from the dropdown.
+        Home leads the list so there is always at least one entry. Consumers
+        that cannot match the current source pick source_list[0] (Home
+        Assistant's HomeKit bridge does exactly this), and "Home" is a far less
+        wrong guess than whichever app happens to sort first.
         """
         data = self.coordinator.data or {}
-        names = build_source_list(data.get("sources"), data.get("apps"))
-        return names or None
+        names = [ACTIVITY_HOME]
+        for name in build_source_list(data.get("sources"), data.get("apps")):
+            if name not in names:
+                names.append(name)
+        return names
 
     @property
     def app_name(self) -> str | None:
@@ -240,6 +256,11 @@ class VidaaTVMediaPlayer(VidaaTVEntity, MediaPlayerEntity):
     async def async_select_source(self, source: str) -> None:
         """Select input source."""
         data = self.coordinator.data or {}
+
+        # Home is a real destination now that it appears in source_list.
+        if source == ACTIVITY_HOME:
+            await self.coordinator.async_send_key("KEY_HOME")
+            return
 
         # Apps first: an app name is launched, not switched to.
         if find_app(source, data.get("apps")):
