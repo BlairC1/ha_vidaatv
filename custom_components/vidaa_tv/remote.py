@@ -97,9 +97,14 @@ class VidaaTVRemote(VidaaTVEntity, RemoteEntity):
 
     @property
     def current_activity(self) -> str | None:
-        """Return current activity (app name, source, or the home screen)."""
+        """Return current activity (app name, source, or the home screen).
+
+        Guarded on coordinator.available as well as data: coordinator.data keeps
+        its last value when an update fails, and naming what the TV was watching
+        while it is unreachable is worse than naming nothing.
+        """
         data = self.coordinator.data
-        if not data:
+        if not data or not self.coordinator.available:
             return None
         activity = data.get("app") or data.get("source")
         if activity:
