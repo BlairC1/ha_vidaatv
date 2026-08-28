@@ -47,6 +47,9 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# How long to wait for the TV to confirm the PIN dialog is actually on screen.
+TIMEOUT_PIN_DIALOG = 10.0
+
 
 def generate_random_mac() -> str:
     """Generate a random MAC address."""
@@ -570,6 +573,20 @@ class VidaaTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
             pin_shown = False
             try:
+                # Discard any saved token BEFORE connecting. Re-pairing exists
+                # because the stored credentials are no longer accepted, but the
+                # client loads and replays them on connect, so the TV rejects it
+                # (CONNACK 4) and pyvidaa then refuses to send the pairing
+                # request at all ("Not connected to TV") - leaving the PIN dialog
+                # permanently unreachable. Clearing first makes this a fresh
+                # pairing, which is what the TV is waiting for.
+                try:
+                    tv.clear_saved_token()
+                    _LOGGER.debug("Cleared saved token for %s before pairing",
+                                  self._host)
+                except Exception as clear_err:  # noqa: BLE001
+                    _LOGGER.debug("Could not clear saved token: %s", clear_err)
+
                 connected = await tv.async_connect(timeout=TIMEOUT_CONNECT)
 
                 # Request pairing even if the connect was REFUSED. A TV whose
@@ -589,18 +606,35 @@ class VidaaTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         "pairing anyway - this is the case re-pairing is for"
                     )
                 try:
-                    await tv.async_start_pairing()
-                    # Keep connection open briefly for PIN to appear
-                    await asyncio.sleep(1)
+                    # wait_for_pin makes the TV confirm the dialog is actually on
+                    # screen, rather than assuming it appeared.
+                    started = await tv.async_start_pairing(
+                        wait_for_pin=TIMEOUT_PIN_DIALOG
+                    )
                     # Hold the connection for the authenticate step.
                     self._pairing_tv = tv
-                    pin_shown = True
+                    pin_shown = bool(started)
                 except Exception as pair_err:  # noqa: BLE001
                     _LOGGER.warning(
                         "Pairing request failed on %s: %s", self._host, pair_err
                     )
+                    pin_shown = False
+                    self._pairing_tv = None
                     errors["base"] = "cannot_connect"
                     await tv.async_disconnect()
+                else:
+                    if not started:
+                        # start_pairing() returns False (and logs "Not connected
+                        # to TV") rather than raising, so a bare call looks like
+                        # success. Asking for a PIN the TV never displayed is
+                        # worse than reporting the failure.
+                        _LOGGER.warning(
+                            "TV did not confirm the PIN dialog on %s", self._host
+                        )
+                        pin_shown = False
+                        self._pairing_tv = None
+                        errors["base"] = "tv_not_responding"
+                        await tv.async_disconnect()
             except Exception as err:
                 _LOGGER.warning("Could not trigger PIN dialog: %s", err)
                 errors["base"] = "cannot_connect"
