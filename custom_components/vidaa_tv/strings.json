@@ -6,7 +6,11 @@
         "description": "Enter the IP address of your Vidaa TV.",
         "data": {
           "host": "Host",
-          "port": "Port"
+          "port": "Port",
+          "mac": "MAC address (optional)"
+        },
+        "data_description": {
+          "mac": "Leave blank to generate one. Set a specific MAC only if the TV has stopped accepting the previous identity - it will reject that client before pairing can start, and only a different identity will connect."
         }
       },
       "certs": {
