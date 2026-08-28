@@ -521,32 +521,6 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 except Exception:  # noqa: BLE001
                     pass
 
-        # Also watch CONNACK results. A rejected connection (rc 4/5) is an auth
-        # failure, but pyvidaa reports it by logging and returning False rather
-        # than raising - so without this it never reaches the exception handler
-        # that triggers Home Assistant's reauth flow, and the TV just shows as
-        # off forever with "bad username or password" in the log.
-        previous_connect = client.on_connect
-
-        def _connect_hook(c, userdata, flags, rc, *args):
-            try:
-                if rc in (4, 5):
-                    self._auth_rejections += 1
-                    _LOGGER.warning(
-                        "TV rejected our credentials (CONNACK %s), failure %s of %s",
-                        rc, self._auth_rejections, self._MAX_AUTH_REJECTIONS,
-                    )
-                elif rc == 0:
-                    self._auth_rejections = 0
-            except Exception:  # noqa: BLE001 - never break the callback
-                pass
-            if previous_connect:
-                try:
-                    previous_connect(c, userdata, flags, rc, *args)
-                except Exception:  # noqa: BLE001
-                    pass
-
-        client.on_connect = _connect_hook
         client.on_message = _hook
         client._vidaa_vol_hook = True
         _LOGGER.debug("Volume broadcast listener attached")
@@ -644,16 +618,31 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # Try to connect with longer timeout for wake-up scenarios
                 connected = await self.tv.async_connect(timeout=5)
 
-                # Repeated credential rejections mean re-pairing, not standby.
-                # Surfacing this as ConfigEntryAuthFailed is what puts the
-                # "Reconfigure"/repair prompt in front of the user; reporting the
-                # TV as off would hide the problem indefinitely.
-                if self._auth_rejections >= self._MAX_AUTH_REJECTIONS:
+                if connected:
                     self._auth_rejections = 0
-                    raise ConfigEntryAuthFailed(
-                        "The TV rejected our credentials. Re-pair the TV to "
-                        "generate new ones."
+                else:
+                    # The probe just proved the TV is answering on its control
+                    # port, so a failed connect here is the TV REFUSING us, not
+                    # the TV being off. On this protocol that means the
+                    # credentials were rejected (pyvidaa logs CONNACK 4/5 and
+                    # returns False rather than raising, which is why this has to
+                    # be inferred rather than caught).
+                    #
+                    # Detected here rather than in the MQTT callback because that
+                    # is only attached after a SUCCESSFUL connect - so when the
+                    # connection never succeeds, it never runs.
+                    self._auth_rejections += 1
+                    _LOGGER.warning(
+                        "TV is reachable but refused the connection "
+                        "(failure %s of %s) - credentials are probably stale",
+                        self._auth_rejections, self._MAX_AUTH_REJECTIONS,
                     )
+                    if self._auth_rejections >= self._MAX_AUTH_REJECTIONS:
+                        self._auth_rejections = 0
+                        raise ConfigEntryAuthFailed(
+                            "The TV refused our credentials. Re-pair the TV to "
+                            "generate new ones."
+                        )
 
                 if not connected:
                     # Reachable but refusing the handshake: still a power state
