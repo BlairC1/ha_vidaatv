@@ -188,6 +188,10 @@ class VidaaTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             self._host = user_input[CONF_HOST]
             self._port = user_input.get(CONF_PORT, DEFAULT_PORT)
+            supplied_mac = (user_input.get(CONF_MAC) or "").strip()
+            if supplied_mac:
+                self._mac = supplied_mac
+                _LOGGER.debug("Pairing as supplied MAC %s", supplied_mac)
 
             # Check for certificates before connecting
             return await self.async_step_certs()
@@ -198,6 +202,13 @@ class VidaaTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 {
                     vol.Required(CONF_HOST): str,
                     vol.Optional(CONF_PORT, default=DEFAULT_PORT): int,
+                    # Optional: the client identity to pair as. Normally left
+                    # blank and a random one is generated. Supply a specific MAC
+                    # when a TV has revoked the previous identity - it rejects
+                    # that client_id before pairing can even be requested, so
+                    # re-pairing cannot recover it and only a different identity
+                    # will connect.
+                    vol.Optional(CONF_MAC): str,
                 }
             ),
             errors=errors,
