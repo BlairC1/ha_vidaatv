@@ -571,14 +571,34 @@ class VidaaTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             pin_shown = False
             try:
                 connected = await tv.async_connect(timeout=TIMEOUT_CONNECT)
-                if connected:
+
+                # Request pairing even if the connect was REFUSED. A TV whose
+                # saved credentials have gone stale rejects the MQTT connection
+                # (CONNACK 4, "bad username or password") - which is precisely
+                # when re-pairing is needed. Gating the pairing request behind a
+                # successful connect made that unrecoverable: you could not pair
+                # because you were not authenticated, and could not authenticate
+                # without pairing, so the PIN never appeared.
+                #
+                # async_start_pairing() publishes on its own and the TV shows the
+                # PIN regardless, so try it either way and only give up if it
+                # actually raises.
+                if not connected:
+                    _LOGGER.debug(
+                        "Connect refused (stale credentials?); requesting "
+                        "pairing anyway - this is the case re-pairing is for"
+                    )
+                try:
                     await tv.async_start_pairing()
                     # Keep connection open briefly for PIN to appear
                     await asyncio.sleep(1)
                     # Hold the connection for the authenticate step.
                     self._pairing_tv = tv
                     pin_shown = True
-                else:
+                except Exception as pair_err:  # noqa: BLE001
+                    _LOGGER.warning(
+                        "Pairing request failed on %s: %s", self._host, pair_err
+                    )
                     errors["base"] = "cannot_connect"
                     await tv.async_disconnect()
             except Exception as err:
