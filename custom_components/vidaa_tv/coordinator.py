@@ -88,6 +88,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._device_info_misses = 0
         self._device_info_unsupported = False
         self._auth_failures = 0
+        self._auth_rejections = 0             # CONNACK 4/5 count
         # Volume/mute captured directly from MQTT broadcasts (see
         # _attach_volume_listener); pyvidaa drops the ARC/external-amp type.
         self._live_volume: int | None = None
@@ -292,6 +293,10 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # so refresh it every N polls rather than on every cycle.
     # Consecutive empty getdeviceinfo replies before we stop asking until the
     # next reconnect. Some firmware never answers; retrying forever is waste.
+    # Credential rejections before asking the user to re-pair. More than
+    # one, so a single transient rejection does not nag.
+    _MAX_AUTH_REJECTIONS = 3
+
     _MAX_DEVICE_INFO_MISSES = 3
 
     _APP_REFRESH_EVERY = 20
@@ -360,7 +365,12 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         try:
             status = await self.tv.async_token_status()
-            if not status.get("has_token") or status.get("needs_reauth"):
+            if status.get("needs_reauth"):
+                # The saved token is beyond refreshing - only re-pairing helps.
+                raise ConfigEntryAuthFailed(
+                    "Saved credentials have expired. Re-pair the TV."
+                )
+            if not status.get("has_token"):
                 return
             if status.get("tokenless"):
                 # Older firmware issues no token at all - it authorizes the
@@ -511,6 +521,32 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 except Exception:  # noqa: BLE001
                     pass
 
+        # Also watch CONNACK results. A rejected connection (rc 4/5) is an auth
+        # failure, but pyvidaa reports it by logging and returning False rather
+        # than raising - so without this it never reaches the exception handler
+        # that triggers Home Assistant's reauth flow, and the TV just shows as
+        # off forever with "bad username or password" in the log.
+        previous_connect = client.on_connect
+
+        def _connect_hook(c, userdata, flags, rc, *args):
+            try:
+                if rc in (4, 5):
+                    self._auth_rejections += 1
+                    _LOGGER.warning(
+                        "TV rejected our credentials (CONNACK %s), failure %s of %s",
+                        rc, self._auth_rejections, self._MAX_AUTH_REJECTIONS,
+                    )
+                elif rc == 0:
+                    self._auth_rejections = 0
+            except Exception:  # noqa: BLE001 - never break the callback
+                pass
+            if previous_connect:
+                try:
+                    previous_connect(c, userdata, flags, rc, *args)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        client.on_connect = _connect_hook
         client.on_message = _hook
         client._vidaa_vol_hook = True
         _LOGGER.debug("Volume broadcast listener attached")
@@ -607,6 +643,18 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     pass
                 # Try to connect with longer timeout for wake-up scenarios
                 connected = await self.tv.async_connect(timeout=5)
+
+                # Repeated credential rejections mean re-pairing, not standby.
+                # Surfacing this as ConfigEntryAuthFailed is what puts the
+                # "Reconfigure"/repair prompt in front of the user; reporting the
+                # TV as off would hide the problem indefinitely.
+                if self._auth_rejections >= self._MAX_AUTH_REJECTIONS:
+                    self._auth_rejections = 0
+                    raise ConfigEntryAuthFailed(
+                        "The TV rejected our credentials. Re-pair the TV to "
+                        "generate new ones."
+                    )
+
                 if not connected:
                     # Reachable but refusing the handshake: still a power state
                     # rather than an error (see _powered_off_data).
@@ -895,6 +943,14 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             self.vlog("Total update took %.2fs", time.monotonic() - start)
             return data
+
+        except ConfigEntryAuthFailed:
+            # Must propagate untouched: Home Assistant starts the reauth flow
+            # from this, and the broad handler below would downgrade it to an
+            # UpdateFailed - leaving the user with a permanently "off" TV and no
+            # prompt to re-pair.
+            self._available = False
+            raise
 
         except Exception as err:
             self._available = False
