@@ -126,7 +126,7 @@ class VidaaTVRemote(VidaaTVEntity, RemoteEntity):
 
     async def async_turn_on(self, activity: str | None = None, **kwargs: Any) -> None:
         """Turn the TV on and optionally start an activity."""
-        await self.coordinator.async_turn_on()
+        await self.coordinator.async_turn_on(context=self._context)
         if activity == ACTIVITY_HOME:
             # "Home" is the launcher, not an app - navigate there via the key.
             await self.coordinator.async_send_key(get_key("home"))
@@ -142,7 +142,7 @@ class VidaaTVRemote(VidaaTVEntity, RemoteEntity):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the TV off."""
-        await self.coordinator.async_turn_off()
+        await self.coordinator.async_turn_off(context=self._context)
 
     async def async_send_key_service(self, key: str) -> None:
         """Handle the vidaa_tv.send_key service for THIS TV."""
