@@ -21,6 +21,12 @@ CONF_KEYFILE: Final = "keyfile"
 # when it is not).
 CONF_HW_MAC: Final = "hw_mac"
 
+# Optional user-supplied action sequences (options flow) that replace the
+# built-in power on/off - e.g. an IR blaster for TVs that ignore Wake-on-LAN
+# from deep standby.
+CONF_TURN_ON_ACTION: Final = "turn_on_action"
+CONF_TURN_OFF_ACTION: Final = "turn_off_action"
+
 # Default values
 DEFAULT_PORT: Final = 36669
 DEFAULT_NAME: Final = "Hisense TV"
