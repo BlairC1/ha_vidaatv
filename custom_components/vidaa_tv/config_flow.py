@@ -19,6 +19,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.selector import (
+    ActionSelector,
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
@@ -36,6 +37,8 @@ from .const import (
     CONF_SW_VERSION,
     CONF_CERTFILE,
     CONF_KEYFILE,
+    CONF_TURN_OFF_ACTION,
+    CONF_TURN_ON_ACTION,
     DEFAULT_NAME,
     DEFAULT_PORT,
     DEFAULT_CERT_DIR,
@@ -692,7 +695,8 @@ class VidaaTVOptionsFlow(config_entries.OptionsFlow):
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
-        current_interval = self.config_entry.options.get("scan_interval", SCAN_INTERVAL)
+        options = self.config_entry.options
+        current_interval = options.get("scan_interval", SCAN_INTERVAL)
         # WoL target: previously-set option, else the TV's real hardware MAC
         # (device_id). Not CONF_MAC, which is the random dynamic-auth MAC.
         current_wol_mac = self.config_entry.options.get(
@@ -721,6 +725,20 @@ class VidaaTVOptionsFlow(config_entries.OptionsFlow):
                     ): TextSelector(
                         TextSelectorConfig(type=TextSelectorType.TEXT)
                     ),
+                    # suggested_value (not default) so clearing the field
+                    # actually removes the action instead of restoring it.
+                    vol.Optional(
+                        CONF_TURN_ON_ACTION,
+                        description={
+                            "suggested_value": options.get(CONF_TURN_ON_ACTION)
+                        },
+                    ): ActionSelector(),
+                    vol.Optional(
+                        CONF_TURN_OFF_ACTION,
+                        description={
+                            "suggested_value": options.get(CONF_TURN_OFF_ACTION)
+                        },
+                    ): ActionSelector(),
                 }
             ),
         )
