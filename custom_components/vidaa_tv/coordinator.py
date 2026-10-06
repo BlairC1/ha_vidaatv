@@ -11,9 +11,11 @@ from datetime import timedelta
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.core import Context, HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.script import Script, async_validate_actions_config
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from pyvidaa import APPS
@@ -26,6 +28,8 @@ from .const import (
     CONF_PORT,
     CONF_HOST,
     CONF_HW_MAC,
+    CONF_TURN_OFF_ACTION,
+    CONF_TURN_ON_ACTION,
     DOMAIN,
     SCAN_INTERVAL,
     STATE_FAKE_SLEEP,
@@ -962,8 +966,42 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     ) from err
             raise UpdateFailed(f"Error communicating with TV: {err}") from err
 
-    async def async_turn_on(self) -> None:
-        """Turn TV on using WoL and power command."""
+    async def _async_run_custom_action(
+        self, option_key: str, label: str, context: Context | None
+    ) -> bool:
+        """Run a user-configured power action. Returns False if none is set.
+
+        It runs IN ADDITION to the built-in behaviour, so it should send a
+        discrete power on/off code - a toggle code would undo a built-in power
+        command that already worked.
+        """
+        sequence = self.entry.options.get(option_key)
+        if not sequence:
+            return False
+        try:
+            actions = await async_validate_actions_config(
+                self.hass, cv.SCRIPT_SCHEMA(sequence)
+            )
+        except Exception as err:  # noqa: BLE001 - surface any config error
+            raise HomeAssistantError(
+                f"The custom {label} action in the Vidaa TV options is invalid: {err}"
+            ) from err
+        _LOGGER.debug("Running custom %s action", label)
+        script = Script(
+            self.hass, actions, f"{self.entry.title} {label}", DOMAIN
+        )
+        await script.async_run(
+            run_variables={"host": self.entry.data.get(CONF_HOST)},
+            context=context or Context(),
+        )
+        return True
+
+    async def async_turn_on(self, context: Context | None = None) -> None:
+        """Turn the TV on: WoL, then any custom action, then the power command.
+
+        The custom action (e.g. an IR power-on code for deep standby) runs
+        alongside WoL rather than replacing it, so each backs up the other.
+        """
         # Resolve the WoL target MAC: explicit wol_mac option wins, else the TV's
         # hardware MAC stored as device_id (config entry, or the value cached from
         # getdeviceinfo once the TV has been seen online). Normalize to bare hex so
@@ -990,14 +1028,42 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 raw_mac,
             )
 
+        # Custom action next: it doesn't need the TV to be reachable, unlike the
+        # MQTT power command below. A failure is logged and re-raised only after
+        # the built-in power command has had its chance.
+        custom_error: Exception | None = None
+        try:
+            await self._async_run_custom_action(
+                CONF_TURN_ON_ACTION, "turn on", context
+            )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Custom turn on action failed: %s", err)
+            custom_error = err
+
         # Also send power on command
         await self.tv.async_power_on()
         await self.async_request_refresh()
+        if custom_error is not None:
+            raise custom_error
 
-    async def async_turn_off(self) -> None:
-        """Turn TV off."""
-        await self.tv.async_power_off()
+    async def async_turn_off(self, context: Context | None = None) -> None:
+        """Turn the TV off: the power command, plus any custom action."""
+        custom_error: Exception | None = None
+        try:
+            await self.tv.async_power_off()
+        finally:
+            # Run the custom action even if the MQTT command failed - that is
+            # exactly when the backup is needed.
+            try:
+                await self._async_run_custom_action(
+                    CONF_TURN_OFF_ACTION, "turn off", context
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("Custom turn off action failed: %s", err)
+                custom_error = err
         await self.async_request_refresh()
+        if custom_error is not None:
+            raise custom_error
 
     async def async_volume_up(self) -> None:
         """Increase volume."""
