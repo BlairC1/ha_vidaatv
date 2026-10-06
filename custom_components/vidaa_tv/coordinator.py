@@ -388,6 +388,14 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 if not await self.tv.async_refresh_token():
                     _LOGGER.debug("Proactive token refresh failed")
+        except ConfigEntryAuthFailed:
+            # Raised deliberately above - let it reach HA so the re-pair prompt
+            # appears. The broad handler below used to log it at DEBUG and drop it.
+            _LOGGER.warning(
+                "No valid saved pairing for this TV; it will ignore commands "
+                "until it is re-paired"
+            )
+            raise
         except Exception as err:
             _LOGGER.debug("Token refresh check failed: %s", err)
 
