@@ -231,11 +231,11 @@ class VidaaTVMediaPlayer(VidaaTVEntity, MediaPlayerEntity):
 
     async def async_turn_on(self) -> None:
         """Turn the TV on."""
-        await self.coordinator.async_turn_on()
+        await self.coordinator.async_turn_on(context=self._context)
 
     async def async_turn_off(self) -> None:
         """Turn the TV off."""
-        await self.coordinator.async_turn_off()
+        await self.coordinator.async_turn_off(context=self._context)
 
     async def async_volume_up(self) -> None:
         """Increase volume."""
