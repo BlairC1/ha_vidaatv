@@ -54,6 +54,25 @@ _LOGGER = logging.getLogger(__name__)
 TIMEOUT_PIN_DIALOG = 10.0
 
 
+def _delete_saved_token(host: str, port: int) -> None:
+    """Remove pyvidaa's saved token for this TV (blocking file I/O).
+
+    Keyword arguments matter: TokenStorage.delete_token's first parameter is
+    device_id, so a positional host would match nothing and delete nothing.
+    """
+    from pyvidaa.config import get_storage
+
+    try:
+        removed = get_storage().delete_token(host=host, port=port)
+    except Exception as err:  # noqa: BLE001 - pairing can still be attempted
+        _LOGGER.warning("Could not clear the saved token for %s: %s", host, err)
+        return
+    _LOGGER.debug(
+        "Saved token for %s:%s %s", host, port,
+        "cleared before pairing" if removed else "not found (nothing to clear)",
+    )
+
+
 def generate_random_mac() -> str:
     """Generate a random MAC address."""
     return ":".join(f"{random.randint(0, 255):02x}" for _ in range(6))
@@ -574,6 +593,18 @@ class VidaaTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 except Exception as err:  # noqa: BLE001 - best effort, falls back to "his"
                     _LOGGER.debug("Could not probe brand for %s: %s", self._host, err)
 
+            # Discard any saved token BEFORE the client exists. pyvidaa loads
+            # saved credentials (client_id, username, password) when it builds
+            # its client, and replays them on connect. Re-pairing exists because
+            # those credentials are no longer accepted, so replaying them gets
+            # CONNACK 4 and pyvidaa then refuses to send the pairing request -
+            # the PIN never appears. tv.clear_saved_token() can't be used for
+            # this: AsyncVidaaTV builds its client lazily, so before connect it
+            # silently does nothing, and after connect it is too late.
+            await self.hass.async_add_executor_job(
+                _delete_saved_token, self._host, self._port
+            )
+
             tv = AsyncVidaaTV(
                 host=self._host,
                 port=self._port,
@@ -587,20 +618,6 @@ class VidaaTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
             pin_shown = False
             try:
-                # Discard any saved token BEFORE connecting. Re-pairing exists
-                # because the stored credentials are no longer accepted, but the
-                # client loads and replays them on connect, so the TV rejects it
-                # (CONNACK 4) and pyvidaa then refuses to send the pairing
-                # request at all ("Not connected to TV") - leaving the PIN dialog
-                # permanently unreachable. Clearing first makes this a fresh
-                # pairing, which is what the TV is waiting for.
-                try:
-                    tv.clear_saved_token()
-                    _LOGGER.debug("Cleared saved token for %s before pairing",
-                                  self._host)
-                except Exception as clear_err:  # noqa: BLE001
-                    _LOGGER.debug("Could not clear saved token: %s", clear_err)
-
                 connected = await tv.async_connect(timeout=TIMEOUT_CONNECT)
 
                 # Request pairing even if the connect was REFUSED. A TV whose
