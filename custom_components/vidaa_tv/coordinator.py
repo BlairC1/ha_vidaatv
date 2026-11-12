@@ -54,6 +54,14 @@ async def _try(coro):
         return err
 
 
+def normalize_mac(value: Any) -> str | None:
+    """Return ``aa:bb:cc:dd:ee:ff`` for anything that is a MAC, else None."""
+    bare = str(value or "").replace(":", "").replace("-", "").strip().lower()
+    if len(bare) == 12 and all(c in "0123456789abcdef" for c in bare):
+        return ":".join(bare[i:i + 2] for i in range(0, 12, 2))
+    return None
+
+
 def _ipv4_broadcast_subnet(host: str) -> str | None:
     """Return the /24 subnet prefix (e.g. "10.0.0") for an IPv4 host.
 
@@ -1174,20 +1182,21 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_send_wol(self) -> None:
         """Send a Wake-on-LAN packet to the TV, if a usable MAC is known."""
-        # Resolve the WoL target MAC: explicit wol_mac option wins, else the TV's
-        # hardware MAC stored as device_id (config entry, or the value cached from
-        # getdeviceinfo once the TV has been seen online). Normalize to bare hex so
-        # a colon/dash-formatted value still works.
-        raw_mac = (
-            self.entry.options.get("wol_mac")      # explicit override wins
-            or self._hw_mac                        # learned this session
-            or self.entry.data.get(CONF_HW_MAC)    # persisted from a previous run
-            or self.entry.data.get(CONF_DEVICE_ID)
-            or self.device_data.get("device_id")
+        # Candidates in priority order: the explicit wol_mac option, the MAC
+        # learned this session, the one persisted from a previous run, then
+        # device_id. Take the first that is actually a MAC. (Taking the first
+        # non-empty one let a junk value block the good ones behind it: on newer
+        # firmware device_id is "wlan", the options form pre-filled it, and
+        # saving the form silently disabled Wake-on-LAN.)
+        candidates = (
+            self.entry.options.get("wol_mac"),
+            self._hw_mac,
+            self.entry.data.get(CONF_HW_MAC),
+            self.entry.data.get(CONF_DEVICE_ID),
+            self.device_data.get("device_id"),
         )
-        normalized = (raw_mac or "").replace(":", "").replace("-", "").lower()
-        if len(normalized) == 12 and all(c in "0123456789abcdef" for c in normalized):
-            mac = ":".join(normalized[i:i+2] for i in range(0, 12, 2))
+        mac = next((m for m in map(normalize_mac, candidates) if m), None)
+        if mac:
             # Derive a /24 broadcast subnet only for a real IPv4 host.
             host = self.entry.data.get(CONF_HOST, "")
             subnet = _ipv4_broadcast_subnet(host)
@@ -1195,9 +1204,9 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self.hass.async_add_executor_job(wake_tv, mac, subnet)
         else:
             _LOGGER.warning(
-                "Skipping Wake-on-LAN: no valid MAC (got %r). Set a 'wol_mac' in the "
-                "integration options to enable wake-on-LAN.",
-                raw_mac,
+                "Skipping Wake-on-LAN: no valid MAC among %r. Set a 'wol_mac' in "
+                "the integration options to enable wake-on-LAN.",
+                [c for c in candidates if c],
             )
 
     def _start_wake_watch(self) -> None:

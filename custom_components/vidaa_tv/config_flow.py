@@ -30,6 +30,7 @@ from homeassistant.helpers.selector import (
     TextSelectorType,
 )
 
+from .coordinator import normalize_mac
 from .const import (
     DOMAIN,
     CONF_DEVICE_ID,
@@ -39,6 +40,7 @@ from .const import (
     CONF_SW_VERSION,
     CONF_CERTFILE,
     CONF_ARC_VOLUME_ENTITY,
+    CONF_HW_MAC,
     CONF_KEYFILE,
     CONF_TURN_OFF_ACTION,
     CONF_TURN_ON_ACTION,
@@ -713,14 +715,36 @@ class VidaaTVOptionsFlow(config_entries.OptionsFlow):
     ) -> FlowResult:
         """Manage the options."""
         if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+            # Store only a real MAC; drop anything else so the learned hardware
+            # MAC is used instead.
+            cleaned = dict(user_input)
+            mac = normalize_mac(cleaned.pop("wol_mac", None))
+            if mac:
+                cleaned["wol_mac"] = mac
+            return self.async_create_entry(title="", data=cleaned)
 
         options = self.config_entry.options
         current_interval = options.get("scan_interval", SCAN_INTERVAL)
-        # WoL target: previously-set option, else the TV's real hardware MAC
-        # (device_id). Not CONF_MAC, which is the random dynamic-auth MAC.
-        current_wol_mac = self.config_entry.options.get(
-            "wol_mac", self.config_entry.data.get(CONF_DEVICE_ID, "")
+        # WoL target shown in the form: the saved option if it is a real MAC,
+        # else the hardware MAC learned from the TV, else device_id if THAT is
+        # a MAC. Never a non-MAC: on newer firmware device_id is "wlan", and
+        # pre-filling it meant simply saving this form stored "wlan" as the
+        # Wake-on-LAN address.
+        data = self.config_entry.data
+        current_wol_mac = next(
+            (
+                mac
+                for mac in map(
+                    normalize_mac,
+                    (
+                        options.get("wol_mac"),
+                        data.get(CONF_HW_MAC),
+                        data.get(CONF_DEVICE_ID),
+                    ),
+                )
+                if mac
+            ),
+            "",
         )
 
         return self.async_show_form(
