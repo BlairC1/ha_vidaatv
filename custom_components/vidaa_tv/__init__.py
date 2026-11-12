@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -43,6 +43,9 @@ class VidaaTVRuntimeData:
 
     coordinator: VidaaTVDataUpdateCoordinator
     tv: AsyncVidaaTV
+    # The options this entry was set up with, to tell an options change (which
+    # needs a reload) from a data-only update (which does not).
+    options: dict[str, Any] = field(default_factory=dict)
 
 
 type VidaaTVConfigEntry = ConfigEntry[VidaaTVRuntimeData]
@@ -86,29 +89,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: VidaaTVConfigEntry) -> b
         enable_persistence=True,
     )
 
-    # Best-effort connect. The TV may be in deep sleep (Wake-on-LAN) — don't block
-    # setup on it, or the entities (including the power button that sends WoL) would
-    # never be created and the TV couldn't be turned on from Home Assistant.
-    try:
-        if not await tv.async_connect(timeout=10):
-            _LOGGER.warning(
-                "TV at %s is not reachable (it may be off); setting up anyway so it "
-                "can be woken from Home Assistant", host
-            )
-    except Exception as err:
-        _LOGGER.warning("Initial connect to TV at %s failed (it may be off): %s", host, err)
-
-    # Create coordinator for data updates. Use async_refresh (not
-    # async_config_entry_first_refresh) so an unreachable TV doesn't abort setup;
-    # the coordinator reconnects on a later poll once the TV is on.
+    # No connect here. The coordinator's first refresh probes the TV and
+    # connects only if it answers, so a TV in deep standby costs a 0.5s probe
+    # rather than a multi-second connect attempt on every Home Assistant start.
+    # Setup never depends on the TV being on - the entities (including the
+    # power control that sends Wake-on-LAN) must exist either way.
     coordinator = VidaaTVDataUpdateCoordinator(hass, tv, entry)
+    # Restore the saved source/app lists first so the dropdowns are populated
+    # even when the TV is off at startup.
+    await coordinator.async_load_cache()
+    # async_refresh (not async_config_entry_first_refresh) so an unreachable TV
+    # doesn't abort setup; the coordinator reconnects on a later poll.
     await coordinator.async_refresh()
 
     # Store runtime data using the modern pattern
-    entry.runtime_data = VidaaTVRuntimeData(coordinator=coordinator, tv=tv)
+    entry.runtime_data = VidaaTVRuntimeData(
+        coordinator=coordinator, tv=tv, options=dict(entry.options)
+    )
 
     # Set up platforms
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # Mirror the amplifier's volume while audio is on ARC (if one is configured).
+    entry.async_on_unload(coordinator.async_setup_amp_listener())
 
     # Register update listener for options
     entry.async_on_unload(entry.add_update_listener(async_update_options))
@@ -140,6 +143,16 @@ async def async_unload_entry(hass: HomeAssistant, entry: VidaaTVConfigEntry) -> 
     return unload_ok
 
 
+async def async_remove_entry(hass: HomeAssistant, entry: VidaaTVConfigEntry) -> None:
+    """Clean up the saved source/app lists when a TV is removed."""
+    from homeassistant.helpers.storage import Store
+
+    try:
+        await Store(hass, 1, f"{DOMAIN}.{entry.entry_id}").async_remove()
+    except Exception as err:  # noqa: BLE001 - nothing depends on this
+        _LOGGER.debug("Could not remove saved lists for %s: %s", entry.title, err)
+
+
 async def async_remove_config_entry_device(
     hass: HomeAssistant,
     config_entry: VidaaTVConfigEntry,
@@ -154,5 +167,13 @@ async def async_remove_config_entry_device(
 
 
 async def async_update_options(hass: HomeAssistant, entry: VidaaTVConfigEntry) -> None:
-    """Handle options update."""
+    """Reload when the OPTIONS change.
+
+    Update listeners also fire for data-only updates, and the coordinator makes
+    one itself when it first learns the TV's Wake-on-LAN MAC. Reloading for that
+    tore the integration down at the very moment the TV had just come online.
+    """
+    runtime = getattr(entry, "runtime_data", None)
+    if runtime is not None and runtime.options == dict(entry.options):
+        return
     await hass.config_entries.async_reload(entry.entry_id)

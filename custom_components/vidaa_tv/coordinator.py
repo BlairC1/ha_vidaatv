@@ -11,10 +11,13 @@ from datetime import timedelta
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import Context, HomeAssistant
+from homeassistant.core import Context, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.debounce import Debouncer
+from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.script import Script, async_validate_actions_config
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -27,6 +30,7 @@ from .const import (
     DEFAULT_PORT,
     CONF_PORT,
     CONF_HOST,
+    CONF_ARC_VOLUME_ENTITY,
     CONF_HW_MAC,
     CONF_TURN_OFF_ACTION,
     CONF_TURN_ON_ACTION,
@@ -82,6 +86,14 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER,
             name=f"{DOMAIN}_{entry.entry_id}",
             update_interval=timedelta(seconds=scan_interval),
+            # Home Assistant's default allows one requested refresh per 10s,
+            # which held back the refreshes the TV's own change broadcasts ask
+            # for. A poll costs ~0.5s, so a much shorter cooldown is affordable:
+            # the first request runs at once and any that arrive during the
+            # cooldown collapse into a single trailing refresh.
+            request_refresh_debouncer=Debouncer(
+                hass, _LOGGER, cooldown=self._REFRESH_COOLDOWN, immediate=True
+            ),
         )
         self.tv = tv
         self.entry = entry
@@ -119,6 +131,18 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._state_direct_seen = False        # does this TV answer on data/state?
         self._last_push_refresh = 0.0          # debounces push-driven refreshes
         self._apps_cache: list[dict] = []    # full app list from last good fetch
+        # pyvidaa keeps ONE response slot per client, so two requests in flight
+        # at once clobber each other. The poll and the power commands both
+        # query the TV, so every request/response exchange takes this lock.
+        self._query_lock = asyncio.Lock()
+        self._deaf_polls = 0                  # consecutive polls with no answers
+        self._deaf_resets = 0                 # reconnects forced by the above
+        self._boot_polls = 0                  # fast polls left while a TV boots
+        self._wake_task: asyncio.Task | None = None  # post-turn-on reachability watch
+        # Source/app lists survive a restart, so the dropdowns are populated
+        # even if Home Assistant starts while the TV is in deep standby.
+        self._store: Store = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}")
+        self._saved_fingerprint: tuple | None = None
         # Live-TV channel info, captured from the transient `livetv` broadcast.
         # The TV emits livetv then immediately sourceswitch/app, so the cached
         # statetype has usually moved on by the time we poll - we must retain it.
@@ -134,6 +158,12 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if tv_on and self._settle_polls > 0:
             self._settle_polls -= 1
             wanted = self._OFF_SCAN_INTERVAL
+        elif not tv_on and self._boot_polls > 0:
+            # Just became reachable (or was just asked to turn on) but still
+            # reports off: a booting TV answers on the network several seconds
+            # before it reports itself on, so look again soon.
+            self._boot_polls -= 1
+            wanted = self._BOOT_SCAN_INTERVAL
         else:
             wanted = self._on_interval if tv_on else self._OFF_SCAN_INTERVAL
         if self.update_interval != wanted:
@@ -154,16 +184,59 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         hass = getattr(self, "hass", None)
         if hass is None:
             return
-        now = time.monotonic()
-        if now - self._last_push_refresh < self._PUSH_REFRESH_DEBOUNCE:
-            return
-        self._last_push_refresh = now
+        # No time gate here: dropping every broadcast after the first meant the
+        # LAST one of a burst (the state the TV actually settled on) could be
+        # ignored until the next poll. The coordinator's debouncer runs the
+        # first request at once and one more after the burst.
+        self._last_push_refresh = time.monotonic()
         try:
             hass.loop.call_soon_threadsafe(
                 lambda: hass.async_create_task(self.async_request_refresh())
             )
         except Exception as err:  # noqa: BLE001 - never break the callback
             _LOGGER.debug("Could not request refresh from callback: %s", err)
+
+    def _push_volume_threadsafe(self) -> None:
+        """Hand a volume broadcast to the event loop (called from MQTT thread)."""
+        hass = getattr(self, "hass", None)
+        if hass is None:
+            return
+        try:
+            hass.loop.call_soon_threadsafe(self._async_push_volume)
+        except Exception as err:  # noqa: BLE001 - never break the callback
+            _LOGGER.debug("Could not push volume from callback: %s", err)
+
+    @callback
+    def _async_push_volume(self) -> None:
+        """Publish the latest volume/mute to entities without a full poll.
+
+        Volume arrives by broadcast the instant it changes, but used to reach
+        the entities only when the next poll rebuilt the data dict - up to a
+        full interval later (measured: ~21s behind the amplifier).
+        """
+        data = self.data
+        if not data or not data.get("is_on"):
+            return
+        try:
+            muted = bool(self._live_muted or self.tv.is_muted)
+        except Exception:  # noqa: BLE001
+            muted = bool(self._live_muted)
+        if (
+            data.get("volume") == self._live_volume
+            and bool(data.get("is_muted")) == muted
+            and data.get("volume_type") == self._live_volume_type
+        ):
+            return
+        # Not async_set_updated_data: that cancels a pending refresh and
+        # restarts the poll timer, and a run of volume steps would keep
+        # postponing the poll.
+        self.data = {
+            **data,
+            "volume": self._live_volume,
+            "is_muted": muted,
+            "volume_type": self._live_volume_type,
+        }
+        self.async_update_listeners()
 
     def vlog(self, msg: str, *args) -> None:
         """Log a verbose line.
@@ -280,9 +353,17 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # applies device_data via DeviceInfo.
         device_registry = dr.async_get(self.hass)
         identifier = self.entry.data.get(CONF_DEVICE_ID) or self.entry.entry_id
-        device_entry = device_registry.async_get_device(
-            identifiers={(DOMAIN, identifier)}
+        # async_get_device(identifiers=...) stops working in HA 2027.8; the
+        # per-config-entry lookup replaces it. Fall back for older cores.
+        by_identifier = getattr(
+            device_registry, "async_get_device_by_identifier", None
         )
+        if by_identifier is not None:
+            device_entry = by_identifier((DOMAIN, identifier), self.entry.entry_id)
+        else:
+            device_entry = device_registry.async_get_device(
+                identifiers={(DOMAIN, identifier)}
+            )
         if device_entry:
             updates = {}
             if self.device_data["model"] and self.device_data["model"] != device_entry.model:
@@ -320,16 +401,39 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # answers on the LAN in milliseconds.
     # A single user action produces several broadcasts in quick succession, so
     # collapse them into one refresh.
-    _PUSH_REFRESH_DEBOUNCE = 2.0
+    _PUSH_REFRESH_DEBOUNCE = 2.0   # legacy; collapsing is done by _REFRESH_COOLDOWN
+
+    # Cooldown between requested refreshes (see the Debouncer in __init__).
+    _REFRESH_COOLDOWN = 1.5
 
     _PROBE_TIMEOUT = 0.5
+
+    # A TV that has just become reachable reports "off" for the first several
+    # seconds of its boot (measured: ~9s between first contact and "on" at the
+    # old 8s cadence). Poll quickly for a short while so "on" is seen promptly.
+    _BOOT_SCAN_INTERVAL = timedelta(seconds=2)
+    _BOOT_POLLS = 10
+
+    # After a turn-on is requested while the TV is unreachable, probe every
+    # second for this long so the first poll happens the moment it answers.
+    _WAKE_WATCH_SECONDS = 60
+
+    # How long to wait for the TV to confirm a power key before falling back to
+    # Wake-on-LAN and any custom action.
+    _POWER_CONFIRM_SECONDS = 4.0
+
+    # Connected, but neither gettvinfo nor sourcelist answered: after this many
+    # consecutive polls rebuild the connection, and after this many rebuilds
+    # with still no answer stop holding the last known power state.
+    _MAX_DEAF_POLLS = 2
+    _MAX_DEAF_RESETS = 3
 
     # While the TV is off we only run the cheap probe, so we can afford to check
     # far more often than the normal poll interval. This is what makes a power-on
     # show up in seconds instead of waiting out a full cycle. Once the TV is on we
     # revert to the configured interval, since a real poll is comparatively
     # expensive (~0.5s of queries).
-    _OFF_SCAN_INTERVAL = timedelta(seconds=8)
+    _OFF_SCAN_INTERVAL = timedelta(seconds=4)
 
     # After the TV comes on, keep polling quickly for a few cycles. The first
     # poll gets the source (a live query), but volume only arrives via the
@@ -486,6 +590,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     elif vtype == 2:
                         self._live_muted = bool(vval)
                     self._live_volume_ts = now
+                    self._push_volume_threadsafe()
                 elif msg.topic.endswith("/platform_service/actions/tvsleep"):
                     # pyvidaa 2.3.0: the TV announces standby the instant it
                     # powers off, INCLUDING when switched off by its own remote.
@@ -671,6 +776,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._device_info_fetched = False
                 self._device_info_misses = 0
                 self._device_info_unsupported = False
+                self._boot_polls = self._BOOT_POLLS
 
             self._available = True
 
@@ -685,7 +791,8 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self._async_maybe_refresh_token()
 
             # Cache device info on first successful connection
-            await self._async_fetch_device_info()
+            async with self._query_lock:
+                await self._async_fetch_device_info()
 
             # NOTE: no periodic resync here, deliberately.
             # This TV pushes a fake_sleep_* frame on every (re)connect regardless of
@@ -739,16 +846,57 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             query_start = time.monotonic()
 
-            sources_res = await _try(self.tv.async_get_sources(timeout=6))
-            tv_info_res = await _try(self.tv.async_get_tv_info(timeout=5))
-            apps_res = await _try(self.tv.async_get_apps()) if want_apps else None
+            # Power state first: it is the reading everything else hangs off,
+            # and when the TV says it is off (the ~5 minutes of network standby
+            # after power-off, the nightly maintenance wake, the first seconds
+            # of a boot) the remaining queries are skipped - they describe a
+            # picture that is not being shown.
+            async with self._query_lock:
+                tv_info_res = await _try(self.tv.async_get_tv_info(timeout=5))
+                reported_off = (
+                    isinstance(tv_info_res, dict)
+                    and str(tv_info_res.get("fake_sleep_state")) == "0"
+                )
+                sources_res = None
+                apps_res = None
+                if not reported_off:
+                    sources_res = await _try(self.tv.async_get_sources(timeout=6))
+                    if want_apps:
+                        apps_res = await _try(self.tv.async_get_apps())
 
-            # getvolume never RETURNS a value on this firmware, but publishing it
-            # makes the TV broadcast its current volume, which the MQTT hook
-            # captures. That broadcast is the only way volume stays current while
-            # nobody is touching the remote - removing this call left volume at
-            # None. Keep the timeout short: we want the side effect, not a reply.
-            await _try(self.tv.async_get_volume(timeout=0.2))
+                    # getvolume never RETURNS a value on this firmware, but
+                    # publishing it makes the TV broadcast its current volume,
+                    # which the MQTT hook captures. That broadcast is the only
+                    # way volume stays current while nobody is touching the
+                    # remote - removing this call left volume at None. Keep the
+                    # timeout short: we want the side effect, not a reply.
+                    await _try(self.tv.async_get_volume(timeout=0.2))
+
+            # --- watchdog: connected but not answering ---------------------------
+            # MQTT keepalives can keep succeeding while the TV's control service
+            # ignores us. Without this the poll held the last known state
+            # indefinitely. Rebuild the connection, and if that keeps failing
+            # stop claiming the TV is on.
+            answered = (isinstance(tv_info_res, dict) and bool(tv_info_res)) or (
+                isinstance(sources_res, list) and bool(sources_res)
+            )
+            if answered:
+                self._deaf_polls = 0
+                self._deaf_resets = 0
+            else:
+                self._deaf_polls += 1
+                if self._deaf_polls >= self._MAX_DEAF_POLLS:
+                    self._deaf_polls = 0
+                    self._deaf_resets += 1
+                    _LOGGER.warning(
+                        "TV at %s is connected but has not answered %s polls in "
+                        "a row; reconnecting (attempt %s)",
+                        self.entry.data.get(CONF_HOST),
+                        self._MAX_DEAF_POLLS, self._deaf_resets,
+                    )
+                    await _try(self.tv.async_reset())
+                    if self._deaf_resets >= self._MAX_DEAF_RESETS:
+                        self._last_is_on = False
 
             # --- current input, from sourcelist ---------------------------------
             # Verified: sourcelist replies in ~0.5s on
@@ -943,6 +1091,7 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 is_on, statetype, volume, app, source,
             )
             self.vlog("Total update took %.2fs", time.monotonic() - start)
+            self._maybe_save_cache()
             return data
 
         except ConfigEntryAuthFailed:
@@ -996,12 +1145,35 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         return True
 
-    async def async_turn_on(self, context: Context | None = None) -> None:
-        """Turn the TV on: WoL, then any custom action, then the power command.
+    # ------------------------------------------------------------------ power
+    async def _async_live_power_state(self) -> bool | None:
+        """Ask the TV whether it is on right now. None if it cannot be asked.
 
-        The custom action (e.g. an IR power-on code for deep standby) runs
-        alongside WoL rather than replacing it, so each backs up the other.
+        pyvidaa's own power_on()/power_off() decide from its CACHED statetype,
+        which this firmware overwrites with a fake_sleep_* frame on every
+        connect regardless of the real state. KEY_POWER is a toggle, so a wrong
+        guess either does nothing ("already off") or switches a TV that is on
+        off again. gettvinfo is a real query and is what the poll trusts.
         """
+        if not self.tv.is_connected:
+            return None
+        async with self._query_lock:
+            info = await _try(self.tv.async_get_tv_info(timeout=2))
+        if isinstance(info, dict) and "fake_sleep_state" in info:
+            return str(info.get("fake_sleep_state")) == "1"
+        return None
+
+    async def _async_wait_for_power(self, want_on: bool, seconds: float) -> bool:
+        """Poll the live power state until it matches, or time out."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.5)
+            if await self._async_live_power_state() is want_on:
+                return True
+        return False
+
+    async def _async_send_wol(self) -> None:
+        """Send a Wake-on-LAN packet to the TV, if a usable MAC is known."""
         # Resolve the WoL target MAC: explicit wol_mac option wins, else the TV's
         # hardware MAC stored as device_id (config entry, or the value cached from
         # getdeviceinfo once the TV has been seen online). Normalize to bare hex so
@@ -1028,29 +1200,102 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 raw_mac,
             )
 
-        # Custom action next: it doesn't need the TV to be reachable, unlike the
-        # MQTT power command below. A failure is logged and re-raised only after
-        # the built-in power command has had its chance.
-        custom_error: Exception | None = None
-        try:
-            await self._async_run_custom_action(
-                CONF_TURN_ON_ACTION, "turn on", context
-            )
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.warning("Custom turn on action failed: %s", err)
-            custom_error = err
+    def _start_wake_watch(self) -> None:
+        """Watch for the TV to answer after a turn-on, then poll at once."""
+        if self._wake_task is not None and not self._wake_task.done():
+            return
+        self._wake_task = self.entry.async_create_background_task(
+            self.hass, self._async_wake_watch(), f"{DOMAIN} wake watch"
+        )
 
-        # Also send power on command
-        await self.tv.async_power_on()
-        await self.async_request_refresh()
+    async def _async_wake_watch(self) -> None:
+        """Probe every second until the TV is reachable, then refresh.
+
+        Without this a turn-on from deep standby was only noticed by the next
+        scheduled probe. Once the TV answers, the boot fast-polls (see
+        _set_poll_cadence) follow it until it reports on.
+        """
+        deadline = time.monotonic() + self._WAKE_WATCH_SECONDS
+        while time.monotonic() < deadline:
+            await asyncio.sleep(1)
+            if self.tv.is_connected or await self._async_is_reachable():
+                _LOGGER.debug("TV answered after turn-on; refreshing")
+                self._boot_polls = self._BOOT_POLLS
+                await self.async_request_refresh()
+                return
+        _LOGGER.debug(
+            "TV did not become reachable within %ss of turn-on",
+            self._WAKE_WATCH_SECONDS,
+        )
+
+    async def async_turn_on(self, context: Context | None = None) -> None:
+        """Turn the TV on.
+
+        Connected (network standby): ask the TV whether it is on, and if not
+        send the power key and wait for it to confirm. That is the fast,
+        reliable path, and nothing else is sent when it works.
+
+        Not connected (deep standby), or the key was not confirmed: send
+        Wake-on-LAN and run any custom turn-on action together, each backing up
+        the other. Custom actions should be discrete "on" codes, not toggles.
+        """
+        live = await self._async_live_power_state()
+        if live is True:
+            _LOGGER.debug("Turn on: the TV already reports on; nothing to send")
+            await self.async_request_refresh()
+            return
+
+        confirmed = False
+        if live is False:
+            _LOGGER.debug("Turn on: TV is in standby and connected; sending power key")
+            await self.tv.async_send_key("KEY_POWER")
+            confirmed = await self._async_wait_for_power(
+                True, self._POWER_CONFIRM_SECONDS
+            )
+            if not confirmed:
+                _LOGGER.debug("Power key not confirmed; falling back to WoL/custom action")
+
+        custom_error: Exception | None = None
+        if not confirmed:
+            await self._async_send_wol()
+            try:
+                ran_custom = await self._async_run_custom_action(
+                    CONF_TURN_ON_ACTION, "turn on", context
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("Custom turn on action failed: %s", err)
+                custom_error = err
+                ran_custom = True
+            if live is None and self.tv.is_connected and not ran_custom:
+                # Connected but the live query went unanswered, and there is no
+                # custom action to rely on: let the library try from its cache.
+                # (Skipped when a custom action ran - a toggle key landing after
+                # a discrete "on" code would switch the TV straight off again.)
+                await _try(self.tv.async_power_on())
+
+        # Follow the TV through its boot: it answers on the network before it
+        # reports itself on.
+        self._boot_polls = self._BOOT_POLLS
+        if self.tv.is_connected:
+            await self.async_request_refresh()
+        else:
+            self._start_wake_watch()
         if custom_error is not None:
             raise custom_error
 
     async def async_turn_off(self, context: Context | None = None) -> None:
-        """Turn the TV off: the power command, plus any custom action."""
+        """Turn the TV off: the power key if it is on, plus any custom action."""
+        live = await self._async_live_power_state()
         custom_error: Exception | None = None
         try:
-            await self.tv.async_power_off()
+            if live is True:
+                await self.tv.async_send_key("KEY_POWER")
+            elif live is None and self.tv.is_connected:
+                # Could not ask; fall back to the library's cached decision
+                # (it sends nothing unless it believes the TV is on).
+                await self.tv.async_power_off()
+            else:
+                _LOGGER.debug("Turn off: the TV is already off or unreachable")
         finally:
             # Run the custom action even if the MQTT command failed - that is
             # exactly when the backup is needed.
@@ -1064,6 +1309,114 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self.async_request_refresh()
         if custom_error is not None:
             raise custom_error
+
+    # ------------------------------------------------- saved source/app lists
+    def _cache_fingerprint(self) -> tuple:
+        """A cheap signature of the lists, to avoid rewriting an unchanged file."""
+        return (
+            tuple(
+                f"{src.get('sourceid')}|{src.get('sourcename')}|"
+                f"{src.get('displayname')}"
+                for src in self._source_cache
+            ),
+            tuple(sorted(str(app.get("name")) for app in self._apps_cache)),
+        )
+
+    async def async_load_cache(self) -> None:
+        """Restore the source/app lists saved by a previous run."""
+        try:
+            saved = await self._store.async_load()
+        except Exception as err:  # noqa: BLE001 - a bad file must not block setup
+            _LOGGER.debug("Could not load saved source/app lists: %s", err)
+            saved = None
+        if isinstance(saved, dict):
+            sources = saved.get("sources")
+            apps = saved.get("apps")
+            if not self._source_cache and isinstance(sources, list):
+                self._source_cache = [s for s in sources if isinstance(s, dict)]
+            if not self._apps_cache and isinstance(apps, list):
+                self._apps_cache = [a for a in apps if isinstance(a, dict)]
+        self._saved_fingerprint = self._cache_fingerprint()
+
+    def _maybe_save_cache(self) -> None:
+        """Save the source/app lists when they have changed."""
+        if not (self._source_cache or self._apps_cache):
+            return
+        fingerprint = self._cache_fingerprint()
+        if fingerprint == self._saved_fingerprint:
+            return
+        self._saved_fingerprint = fingerprint
+
+        def _data() -> dict[str, Any]:
+            # is_signal marks the input selected at save time; clear it so a
+            # restored list never claims a current input.
+            return {
+                "sources": [{**src, "is_signal": "0"} for src in self._source_cache],
+                "apps": list(self._apps_cache),
+            }
+
+        self._store.async_delay_save(_data, 30)
+
+    async def async_remove_cache(self) -> None:
+        """Delete the saved lists (the config entry is being removed)."""
+        await self._store.async_remove()
+
+    # ------------------------------------------- external amplifier (ARC) volume
+    @callback
+    def async_setup_amp_listener(self):
+        """Mirror the configured amplifier's volume while audio is on ARC.
+
+        Returns the unsubscribe callback (a no-op when nothing is configured).
+        """
+        amp = self.entry.options.get(CONF_ARC_VOLUME_ENTITY)
+        if not amp:
+            return lambda: None
+
+        @callback
+        def _amp_changed(event) -> None:
+            new = event.data.get("new_state")
+            if new is None or self._live_volume_type != 1:
+                return
+            level = new.attributes.get("volume_level")
+            if not isinstance(level, (int, float)):
+                return
+            # The TV shows the amp's level truncated to a whole number
+            # (measured: amp 54.5 -> TV 54), so truncate the same way.
+            mirrored = int(float(level) * 100 + 1e-6)
+            if mirrored != self._live_volume:
+                self._live_volume = mirrored
+                self._async_push_volume()
+
+        return async_track_state_change_event(self.hass, [amp], _amp_changed)
+
+    async def _async_set_amp_volume(self, entity_id: str, level: float) -> bool:
+        """Set an absolute level on the amplifier. False if it could not be used."""
+        state = self.hass.states.get(entity_id)
+        if state is None or state.state in ("unavailable", "unknown", "off"):
+            _LOGGER.debug(
+                "ARC volume entity %s is %s; stepping through the TV instead",
+                entity_id, state.state if state else "missing",
+            )
+            return False
+        level = max(0.0, min(1.0, float(level)))
+        try:
+            await self.hass.services.async_call(
+                "media_player", "volume_set",
+                {"entity_id": entity_id, "volume_level": level},
+                blocking=True,
+            )
+        except Exception as err:  # noqa: BLE001 - fall back to stepping
+            _LOGGER.warning(
+                "Could not set volume on %s (%s); stepping through the TV instead",
+                entity_id, err,
+            )
+            return False
+        _LOGGER.debug("ARC volume set to %.3f directly on %s", level, entity_id)
+        # Stop any stepping run that is still aiming at an older target.
+        self._volume_target = None
+        self._live_volume = int(level * 100 + 1e-6)
+        self._async_push_volume()
+        return True
 
     async def async_volume_up(self) -> None:
         """Increase volume."""
@@ -1080,8 +1433,12 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self.tv.async_mute()
         await self.async_request_refresh()
 
-    async def async_set_volume(self, volume: int) -> None:
+    async def async_set_volume(self, volume: int, level: float | None = None) -> None:
         """Set volume level.
+
+        ``level`` is the exact 0.0-1.0 value requested, when the caller has it;
+        it lets an external amplifier be set in half steps the TV's whole-number
+        scale cannot express.
 
         On TV speakers the absolute command works, so send it directly. On ARC the
         TV ignores absolute and we must step - but HA sliders fire volume_set
@@ -1090,6 +1447,15 @@ class VidaaTVDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         always converge on the LATEST value instead of stacking loops that fight.
         """
         target = max(0, min(100, int(volume)))
+
+        # ARC with an amplifier entity configured: set the amp directly. It
+        # takes an absolute level in one command, where the TV can only relay
+        # one CEC key press at a time (~0.75s each).
+        amp = self.entry.options.get(CONF_ARC_VOLUME_ENTITY)
+        if amp and self._live_volume_type == 1:
+            wanted = level if level is not None else target / 100
+            if await self._async_set_amp_volume(amp, wanted):
+                return
 
         # TV speakers (or no reading yet): absolute works - fire and forget.
         if self._live_volume_type != 1 or self._live_volume is None:

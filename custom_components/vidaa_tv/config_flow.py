@@ -20,6 +20,8 @@ from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.selector import (
     ActionSelector,
+    EntitySelector,
+    EntitySelectorConfig,
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
@@ -36,6 +38,7 @@ from .const import (
     CONF_BRAND,
     CONF_SW_VERSION,
     CONF_CERTFILE,
+    CONF_ARC_VOLUME_ENTITY,
     CONF_KEYFILE,
     CONF_TURN_OFF_ACTION,
     CONF_TURN_ON_ACTION,
@@ -756,6 +759,12 @@ class VidaaTVOptionsFlow(config_entries.OptionsFlow):
                             "suggested_value": options.get(CONF_TURN_OFF_ACTION)
                         },
                     ): ActionSelector(),
+                    vol.Optional(
+                        CONF_ARC_VOLUME_ENTITY,
+                        description={
+                            "suggested_value": options.get(CONF_ARC_VOLUME_ENTITY)
+                        },
+                    ): EntitySelector(EntitySelectorConfig(domain="media_player")),
                 }
             ),
         )

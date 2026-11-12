@@ -27,6 +27,11 @@ CONF_HW_MAC: Final = "hw_mac"
 CONF_TURN_ON_ACTION: Final = "turn_on_action"
 CONF_TURN_OFF_ACTION: Final = "turn_off_action"
 
+# Optional media_player entity for the amplifier/soundbar on HDMI ARC. When set,
+# volume_set is sent straight to it while audio is on ARC, instead of being
+# emulated with one CEC key press per step through the TV.
+CONF_ARC_VOLUME_ENTITY: Final = "arc_volume_entity"
+
 # Default values
 DEFAULT_PORT: Final = 36669
 DEFAULT_NAME: Final = "Hisense TV"

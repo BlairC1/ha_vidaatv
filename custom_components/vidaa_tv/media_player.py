@@ -246,12 +246,17 @@ class VidaaTVMediaPlayer(VidaaTVEntity, MediaPlayerEntity):
         await self.coordinator.async_volume_down()
 
     async def async_mute_volume(self, mute: bool) -> None:
-        """Mute the volume."""
-        await self.coordinator.async_mute()
+        """Mute or unmute the volume.
+
+        The TV only has a mute TOGGLE, so send it only when the state differs -
+        otherwise asking to mute an already-muted TV would unmute it.
+        """
+        if bool(mute) != bool(self.is_volume_muted):
+            await self.coordinator.async_mute()
 
     async def async_set_volume_level(self, volume: float) -> None:
         """Set volume level (0.0 to 1.0)."""
-        await self.coordinator.async_set_volume(int(volume * 100))
+        await self.coordinator.async_set_volume(round(volume * 100), level=volume)
 
     async def async_select_source(self, source: str) -> None:
         """Select input source."""
