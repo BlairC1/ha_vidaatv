@@ -63,13 +63,15 @@
           "scan_interval": "Polling interval",
           "wol_mac": "Wake-on-LAN MAC address",
           "turn_on_action": "Custom turn on action",
-          "turn_off_action": "Custom turn off action"
+          "turn_off_action": "Custom turn off action",
+          "arc_volume_entity": "Amplifier for ARC volume"
         },
         "data_description": {
           "scan_interval": "How often to poll the TV for state updates (in seconds).",
           "wol_mac": "MAC address to use for Wake-on-LAN. Leave empty to use the default.",
-          "turn_on_action": "Optional. Runs in addition to the built-in Wake-on-LAN and power on - e.g. a discrete IR power-on code to wake the TV from deep standby. Use discrete codes, not a power toggle.",
-          "turn_off_action": "Optional. Runs in addition to the built-in power off - e.g. a discrete IR power-off code. Use discrete codes, not a power toggle."
+          "turn_on_action": "Optional. A backup for turning on: runs together with Wake-on-LAN whenever the TV cannot be switched on over the network (for example from deep standby). Use a discrete power-on code, not a power toggle.",
+          "turn_off_action": "Optional. Runs in addition to the built-in power off - e.g. a discrete IR power-off code. Use discrete codes, not a power toggle.",
+          "arc_volume_entity": "Optional. The media player entity of the amplifier or soundbar connected by HDMI ARC. While audio is on ARC, setting a volume level is sent straight to it (instant and exact) instead of stepping through the TV one press at a time, and its volume is mirrored onto the TV entity. Use an entity whose volume matches the number the TV shows."
         }
       }
     }
